@@ -1,0 +1,6 @@
+{
+  "dependencies": {
+    "freemail": "^1.7.0",
+    "playwright": "^1.58.2"
+  }
+}
