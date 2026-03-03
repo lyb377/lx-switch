@@ -67,6 +67,16 @@ type LoginAudit struct {
 	CreatedAt time.Time `json:"createdAt"`
 }
 
+type OpAudit struct {
+	ID        int64     `json:"id"`
+	Action    string    `json:"action"`
+	Target    string    `json:"target"`
+	Detail    string    `json:"detail"`
+	IP        string    `json:"ip"`
+	UserAgent string    `json:"userAgent"`
+	CreatedAt time.Time `json:"createdAt"`
+}
+
 type SaveReq struct {
 	Name    string `json:"name"`
 	Target  string `json:"target"`
@@ -126,6 +136,7 @@ func main() {
 	mux.HandleFunc("/api/meta", app.withAuth(app.handleMeta))
 	mux.HandleFunc("/api/login-audits", app.withAuth(app.handleLoginAudits))
 	mux.HandleFunc("/api/login-audits/export", app.withAuth(app.handleLoginAuditsExport))
+	mux.HandleFunc("/api/op-audits", app.withAuth(app.handleOpAudits))
 
 	srv := &http.Server{Addr: listen, Handler: logging(mux)}
 	log.Printf("lx-switch listening on %s, data=%s", listen, dataDir)
@@ -158,6 +169,15 @@ CREATE TABLE IF NOT EXISTS login_audits (
   user_agent TEXT,
   success INTEGER NOT NULL,
   reason TEXT,
+  created_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS op_audits (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  action TEXT NOT NULL,
+  target TEXT,
+  detail TEXT,
+  ip TEXT,
+  user_agent TEXT,
   created_at TEXT NOT NULL
 );
 `
@@ -431,6 +451,31 @@ func (a *App) handleLoginAuditsExport(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
+func (a *App) handleOpAudits(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		w.WriteHeader(http.StatusMethodNotAllowed)
+		return
+	}
+	limit := parseIntRange(r.URL.Query().Get("limit"), 50, 1, 200)
+	offset := parseIntRange(r.URL.Query().Get("offset"), 0, 0, 1_000_000)
+	list, err := a.listOpAudits(limit, offset)
+	if err != nil {
+		http.Error(w, err.Error(), 500)
+		return
+	}
+	total, err := a.countOpAudits()
+	if err != nil {
+		http.Error(w, err.Error(), 500)
+		return
+	}
+	_ = json.NewEncoder(w).Encode(map[string]any{
+		"items":  list,
+		"total":  total,
+		"limit":  limit,
+		"offset": offset,
+	})
+}
+
 func (a *App) handleProviders(w http.ResponseWriter, r *http.Request) {
 	switch r.Method {
 	case http.MethodGet:
@@ -458,6 +503,7 @@ func (a *App) handleProviders(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		id, _ := res.LastInsertId()
+		_ = a.insertOpAudit("provider.create", req.Target, fmt.Sprintf("id=%d name=%s", id, req.Name), clientIP(r), strings.TrimSpace(r.UserAgent()))
 		_ = json.NewEncoder(w).Encode(map[string]any{"ok": true, "id": id})
 	default:
 		w.WriteHeader(http.StatusMethodNotAllowed)
@@ -493,13 +539,22 @@ func (a *App) handleProviderByID(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, err.Error(), 500)
 			return
 		}
+		_ = a.insertOpAudit("provider.update", req.Target, fmt.Sprintf("id=%d name=%s", id, req.Name), clientIP(r), strings.TrimSpace(r.UserAgent()))
 		_ = json.NewEncoder(w).Encode(map[string]any{"ok": true})
 	case http.MethodDelete:
+		p, _ := a.getProvider(id)
 		_, err := a.db.Exec(`DELETE FROM providers WHERE id=?`, id)
 		if err != nil {
 			http.Error(w, err.Error(), 500)
 			return
 		}
+		tgt := ""
+		nm := ""
+		if p != nil {
+			tgt = p.Target
+			nm = p.Name
+		}
+		_ = a.insertOpAudit("provider.delete", tgt, fmt.Sprintf("id=%d name=%s", id, nm), clientIP(r), strings.TrimSpace(r.UserAgent()))
 		_ = json.NewEncoder(w).Encode(map[string]any{"ok": true})
 	default:
 		w.WriteHeader(http.StatusMethodNotAllowed)
@@ -536,6 +591,7 @@ func (a *App) handleActivate(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), 500)
 		return
 	}
+	_ = a.insertOpAudit("provider.activate", p.Target, fmt.Sprintf("id=%d name=%s backup=%s", p.ID, p.Name, bk), clientIP(r), strings.TrimSpace(r.UserAgent()))
 	_ = json.NewEncoder(w).Encode(map[string]any{"ok": true, "backup": bk})
 }
 
@@ -607,6 +663,7 @@ func (a *App) handleRollback(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), 500)
 		return
 	}
+	_ = a.insertOpAudit("backup.rollback", target, fmt.Sprintf("backup=%s restored=%s", name, dst), clientIP(r), strings.TrimSpace(r.UserAgent()))
 	_ = json.NewEncoder(w).Encode(map[string]any{"ok": true, "restored": dst})
 }
 
@@ -647,6 +704,37 @@ func (a *App) listLoginAudits(limit, offset int) ([]LoginAudit, error) {
 			return nil, err
 		}
 		it.Success = ok == 1
+		it.CreatedAt, _ = time.Parse(time.RFC3339, ts)
+		out = append(out, it)
+	}
+	return out, nil
+}
+
+func (a *App) insertOpAudit(action, target, detail, ip, ua string) error {
+	_, err := a.db.Exec(`INSERT INTO op_audits(action,target,detail,ip,user_agent,created_at) VALUES(?,?,?,?,?,?)`,
+		action, target, detail, ip, ua, time.Now().Format(time.RFC3339))
+	return err
+}
+
+func (a *App) countOpAudits() (int, error) {
+	var n int
+	err := a.db.QueryRow(`SELECT COUNT(1) FROM op_audits`).Scan(&n)
+	return n, err
+}
+
+func (a *App) listOpAudits(limit, offset int) ([]OpAudit, error) {
+	rows, err := a.db.Query(`SELECT id,action,target,detail,ip,user_agent,created_at FROM op_audits ORDER BY id DESC LIMIT ? OFFSET ?`, limit, offset)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []OpAudit
+	for rows.Next() {
+		var it OpAudit
+		var ts string
+		if err := rows.Scan(&it.ID, &it.Action, &it.Target, &it.Detail, &it.IP, &it.UserAgent, &ts); err != nil {
+			return nil, err
+		}
 		it.CreatedAt, _ = time.Parse(time.RFC3339, ts)
 		out = append(out, it)
 	}
@@ -950,12 +1038,26 @@ const indexHTML = `<!doctype html>
     <table><thead><tr><th>时间</th><th>IP</th><th>结果</th><th>原因</th><th>UA</th></tr></thead><tbody id="audits"></tbody></table>
   </div>
 
+  <div class="card">
+    <h3>操作审计</h3>
+    <div class="actions">
+      <button onclick="prevOpPage()">上一页</button>
+      <button onclick="nextOpPage()">下一页</button>
+      <button class="ghost" onclick="loadOpAudits()">刷新操作日志</button>
+    </div>
+    <div id="opPager" class="muted"></div>
+    <table><thead><tr><th>时间</th><th>Action</th><th>Target</th><th>Detail</th><th>IP</th><th>UA</th></tr></thead><tbody id="ops"></tbody></table>
+  </div>
+
 <script>
 let editId = null;
 let providerMap = {};
 let auditOffset = 0;
 const auditLimit = 20;
 let auditTotal = 0;
+let opOffset = 0;
+const opLimit = 20;
+let opTotal = 0;
 
 function H(){ return {'Content-Type':'application/json'}; }
 async function api(url,opt={}){ const r=await fetch(url,{...opt,credentials:'same-origin',headers:{...(opt.headers||{}),...H()}}); if(!r.ok) throw new Error(await r.text()); return r.json(); }
@@ -1092,12 +1194,41 @@ function exportAudits(){
   window.open('/api/login-audits/export?limit=2000','_blank');
 }
 
+async function loadOpAudits(){
+  const res=await api('/api/op-audits?limit='+opLimit+'&offset='+opOffset);
+  const list=res.items||[];
+  opTotal = res.total||0;
+  const tb=document.getElementById('ops'); tb.innerHTML='';
+  const pager=document.getElementById('opPager');
+  const from = opTotal===0 ? 0 : (opOffset+1);
+  const to = Math.min(opOffset+opLimit, opTotal);
+  pager.textContent='操作日志：共 '+opTotal+' 条，当前 '+from+' - '+to;
+  list.forEach(a=>{
+    const tr=document.createElement('tr');
+    const ua=(a.userAgent||'').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+    tr.innerHTML='<td>'+(a.createdAt||'')+'</td><td>'+(a.action||'')+'</td><td>'+(a.target||'')+'</td><td>'+(a.detail||'')+'</td><td>'+(a.ip||'')+'</td><td>'+ua+'</td>';
+    tb.appendChild(tr);
+  });
+}
+
+function prevOpPage(){
+  opOffset = Math.max(0, opOffset - opLimit);
+  loadOpAudits();
+}
+
+function nextOpPage(){
+  if(opOffset + opLimit >= opTotal) return;
+  opOffset += opLimit;
+  loadOpAudits();
+}
+
 async function loadAll(){
   cancelEdit();
   await loadMeta();
   await loadProviders();
   await loadBackups();
   await loadAudits();
+  await loadOpAudits();
 }
 
 window.addEventListener('DOMContentLoaded', loadAll);
