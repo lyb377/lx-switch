@@ -77,7 +77,9 @@ func main() {
 	}
 
 	mux := http.NewServeMux()
-	mux.HandleFunc("/", app.handleIndex)
+	mux.HandleFunc("/", app.withPageAuth(app.handleIndex))
+	mux.HandleFunc("/login", app.handleLogin)
+	mux.HandleFunc("/logout", app.withPageAuth(app.handleLogout))
 	mux.HandleFunc("/healthz", app.handleHealth)
 	mux.HandleFunc("/api/providers", app.withAuth(app.handleProviders))
 	mux.HandleFunc("/api/providers/", app.withAuth(app.handleProviderByID))
@@ -122,6 +124,11 @@ func (a *App) withAuth(next http.HandlerFunc) http.HandlerFunc {
 		if t == "" {
 			t = r.URL.Query().Get("token")
 		}
+		if t == "" {
+			if c, err := r.Cookie("lx_token"); err == nil {
+				t = c.Value
+			}
+		}
 		if t != a.adminToken {
 			w.WriteHeader(http.StatusUnauthorized)
 			_ = json.NewEncoder(w).Encode(map[string]string{"error": "unauthorized"})
@@ -131,9 +138,63 @@ func (a *App) withAuth(next http.HandlerFunc) http.HandlerFunc {
 	}
 }
 
+func (a *App) withPageAuth(next http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		c, err := r.Cookie("lx_token")
+		if err != nil || c.Value != a.adminToken {
+			http.Redirect(w, r, "/login", http.StatusFound)
+			return
+		}
+		next(w, r)
+	}
+}
+
 func (a *App) handleIndex(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	_, _ = io.WriteString(w, indexHTML)
+}
+
+func (a *App) handleLogin(w http.ResponseWriter, r *http.Request) {
+	if r.Method == http.MethodGet {
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		_, _ = io.WriteString(w, loginHTML)
+		return
+	}
+	if r.Method != http.MethodPost {
+		w.WriteHeader(http.StatusMethodNotAllowed)
+		return
+	}
+	_ = r.ParseForm()
+	t := strings.TrimSpace(r.FormValue("token"))
+	if t != a.adminToken {
+		w.WriteHeader(http.StatusUnauthorized)
+		_, _ = io.WriteString(w, "token 错误")
+		return
+	}
+	secure := r.TLS != nil || strings.EqualFold(r.Header.Get("X-Forwarded-Proto"), "https")
+	http.SetCookie(w, &http.Cookie{
+		Name:     "lx_token",
+		Value:    t,
+		Path:     "/",
+		HttpOnly: true,
+		Secure:   secure,
+		SameSite: http.SameSiteLaxMode,
+		MaxAge:   7 * 24 * 3600,
+	})
+	http.Redirect(w, r, "/", http.StatusFound)
+}
+
+func (a *App) handleLogout(w http.ResponseWriter, r *http.Request) {
+	http.SetCookie(w, &http.Cookie{
+		Name:     "lx_token",
+		Value:    "",
+		Path:     "/",
+		HttpOnly: true,
+		Secure:   false,
+		SameSite: http.SameSiteLaxMode,
+		MaxAge:   -1,
+	})
+	http.Redirect(w, r, "/login", http.StatusFound)
 }
 
 func (a *App) handleHealth(w http.ResponseWriter, r *http.Request) {
@@ -452,9 +513,10 @@ const indexHTML = `<!doctype html>
   <p class="muted">Server-native switch panel for Claude/Codex/OpenClaw/Gemini</p>
 
   <div class="card">
-    <label>Admin Token</label>
-    <input id="token" placeholder="X-Admin-Token"/>
-    <button onclick="loadAll()">连接</button>
+    <div style="display:flex;justify-content:space-between;align-items:center;gap:10px;">
+      <div class="muted">已登录，可直接管理 Provider</div>
+      <button style="width:auto" onclick="location.href='/logout'">退出登录</button>
+    </div>
   </div>
 
   <div class="card">
@@ -488,10 +550,9 @@ const indexHTML = `<!doctype html>
   </div>
 
 <script>
-let T='';
-function H(){ return {'Content-Type':'application/json','X-Admin-Token':T}; }
-async function api(url,opt={}){ const r=await fetch(url,{...opt,headers:{...(opt.headers||{}),...H()}}); if(!r.ok) throw new Error(await r.text()); return r.json(); }
-async function loadAll(){ T=document.getElementById('token').value.trim(); await loadProviders(); await loadBackups(); }
+function H(){ return {'Content-Type':'application/json'}; }
+async function api(url,opt={}){ const r=await fetch(url,{...opt,credentials:'same-origin',headers:{...(opt.headers||{}),...H()}}); if(!r.ok) throw new Error(await r.text()); return r.json(); }
+async function loadAll(){ await loadProviders(); await loadBackups(); }
 async function createProvider(){
   const body={
     name:v('name'),target:v('target'),baseUrl:v('baseUrl'),apiKey:v('apiKey'),model:v('model'),notes:v('notes')
@@ -527,5 +588,31 @@ async function loadBackups(){
   });
 }
 async function rollback(name){ if(!confirm('回滚到 '+name+' ?')) return; await api('/api/rollback',{method:'POST',body:JSON.stringify({name})}); alert('回滚完成'); }
+window.addEventListener('DOMContentLoaded', loadAll);
 </script>
 </body></html>`
+
+const loginHTML = `<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8"/>
+  <meta name="viewport" content="width=device-width, initial-scale=1"/>
+  <title>LX Switch Login</title>
+  <style>
+    body{font-family:system-ui,-apple-system,Segoe UI,Roboto,sans-serif;background:#f7f7f8;margin:0}
+    .wrap{max-width:420px;margin:80px auto;background:#fff;border:1px solid #e5e7eb;border-radius:12px;padding:20px}
+    input,button{width:100%;padding:10px;margin-top:10px}
+    .muted{font-size:12px;color:#666}
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <h3>LX Switch 登录</h3>
+    <p class="muted">输入管理员 Token 进入面板</p>
+    <form method="post" action="/login">
+      <input type="password" name="token" placeholder="Admin Token" required />
+      <button type="submit">登录</button>
+    </form>
+  </div>
+</body>
+</html>`
