@@ -74,6 +74,11 @@ type OpAuditQuery struct {
 	Target string
 }
 
+type ProviderQuery struct {
+	Search string
+	Target string
+}
+
 type OpAudit struct {
 	ID        int64     `json:"id"`
 	Action    string    `json:"action"`
@@ -136,6 +141,7 @@ func main() {
 	mux.HandleFunc("/logout", app.withPageAuth(app.handleLogout))
 	mux.HandleFunc("/healthz", app.handleHealth)
 	mux.HandleFunc("/api/providers", app.withAuth(app.handleProviders))
+	mux.HandleFunc("/api/providers/import", app.withAuth(app.handleProvidersImport))
 	mux.HandleFunc("/api/providers/", app.withAuth(app.handleProviderByID))
 	mux.HandleFunc("/api/activate", app.withAuth(app.handleActivate))
 	mux.HandleFunc("/api/backups", app.withAuth(app.handleBackups))
@@ -518,7 +524,11 @@ func (a *App) handleOpAuditsExport(w http.ResponseWriter, r *http.Request) {
 func (a *App) handleProviders(w http.ResponseWriter, r *http.Request) {
 	switch r.Method {
 	case http.MethodGet:
-		list, err := a.listProviders()
+		q := ProviderQuery{
+			Search: strings.TrimSpace(r.URL.Query().Get("search")),
+			Target: strings.TrimSpace(r.URL.Query().Get("target")),
+		}
+		list, err := a.listProviders(q)
 		if err != nil {
 			http.Error(w, err.Error(), 500)
 			return
@@ -547,6 +557,58 @@ func (a *App) handleProviders(w http.ResponseWriter, r *http.Request) {
 	default:
 		w.WriteHeader(http.StatusMethodNotAllowed)
 	}
+}
+
+func (a *App) handleProvidersImport(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		w.WriteHeader(http.StatusMethodNotAllowed)
+		return
+	}
+	r.Body = http.MaxBytesReader(w, r.Body, 1<<20)
+	var req struct {
+		Items []SaveReq `json:"items"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, err.Error(), 400)
+		return
+	}
+	if len(req.Items) == 0 {
+		http.Error(w, "items required", 400)
+		return
+	}
+	if len(req.Items) > 200 {
+		http.Error(w, "too many items (max 200)", 400)
+		return
+	}
+
+	tx, err := a.db.Begin()
+	if err != nil {
+		http.Error(w, err.Error(), 500)
+		return
+	}
+	defer tx.Rollback()
+
+	now := time.Now().Format(time.RFC3339)
+	imported := 0
+	for i := range req.Items {
+		it := req.Items[i]
+		if err := validateSaveReq(&it); err != nil {
+			http.Error(w, fmt.Sprintf("item[%d]: %v", i, err), 400)
+			return
+		}
+		if _, err := tx.Exec(`INSERT INTO providers(name,target,base_url,api_key,model,notes,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?)`,
+			it.Name, it.Target, it.BaseURL, it.APIKey, it.Model, it.Notes, now, now); err != nil {
+			http.Error(w, err.Error(), 500)
+			return
+		}
+		imported++
+	}
+	if err := tx.Commit(); err != nil {
+		http.Error(w, err.Error(), 500)
+		return
+	}
+	_ = a.insertOpAudit("provider.import", "batch", fmt.Sprintf("count=%d", imported), clientIP(r), strings.TrimSpace(r.UserAgent()))
+	_ = json.NewEncoder(w).Encode(map[string]any{"ok": true, "imported": imported})
 }
 
 func (a *App) handleProviderByID(w http.ResponseWriter, r *http.Request) {
@@ -805,8 +867,20 @@ func (a *App) listOpAudits(q OpAuditQuery) ([]OpAudit, error) {
 	return out, nil
 }
 
-func (a *App) listProviders() ([]Provider, error) {
-	rows, err := a.db.Query(`SELECT id,name,target,base_url,api_key,model,notes,created_at,updated_at FROM providers ORDER BY id DESC`)
+func (a *App) listProviders(q ProviderQuery) ([]Provider, error) {
+	query := `SELECT id,name,target,base_url,api_key,model,notes,created_at,updated_at FROM providers WHERE 1=1`
+	args := []any{}
+	if q.Target != "" {
+		query += ` AND target=?`
+		args = append(args, q.Target)
+	}
+	if q.Search != "" {
+		query += ` AND (name LIKE ? OR model LIKE ? OR base_url LIKE ? OR notes LIKE ?)`
+		kw := "%" + q.Search + "%"
+		args = append(args, kw, kw, kw, kw)
+	}
+	query += ` ORDER BY id DESC`
+	rows, err := a.db.Query(query, args...)
 	if err != nil {
 		return nil, err
 	}
@@ -1097,7 +1171,33 @@ const indexHTML = `<!doctype html>
 
   <div class="card">
     <h3>Providers</h3>
+    <div class="row">
+      <div>
+        <label>搜索</label>
+        <input id="providerSearch" placeholder="name/model/baseUrl/notes"/>
+      </div>
+      <div>
+        <label>Target 过滤</label>
+        <select id="providerTargetFilter">
+          <option value="">全部</option>
+          <option>openclaw</option><option>claude</option><option>codex</option><option>gemini</option>
+        </select>
+      </div>
+    </div>
+    <div class="actions">
+      <button onclick="applyProviderFilter()">应用过滤</button>
+      <button class="ghost" onclick="clearProviderFilter()">清空过滤</button>
+    </div>
     <table><thead><tr><th>ID</th><th>Name</th><th>Target</th><th>Model</th><th>操作</th></tr></thead><tbody id="rows"></tbody></table>
+  </div>
+
+  <div class="card">
+    <h3>批量导入 Providers(JSON)</h3>
+    <p class="muted">格式：{"items":[{"name":"...","target":"openclaw","baseUrl":"https://...","apiKey":"...","model":"...","notes":"..."}]}</p>
+    <textarea id="importJson" rows="6" placeholder='{"items":[{"name":"demo","target":"openclaw","baseUrl":"https://cli.lyb123.top/v1","model":"gpt-5.3-codex"}]}'></textarea>
+    <div class="actions">
+      <button onclick="importProviders()">导入</button>
+    </div>
   </div>
 
   <div class="card">
@@ -1147,6 +1247,8 @@ const indexHTML = `<!doctype html>
 <script>
 let editId = null;
 let providerMap = {};
+let providerSearch = '';
+let providerTargetFilter = '';
 let auditOffset = 0;
 const auditLimit = 20;
 let auditTotal = 0;
@@ -1215,7 +1317,8 @@ async function loadMeta(){
 }
 
 async function loadProviders(){
-  const list=await api('/api/providers');
+  const q='search='+encodeURIComponent(providerSearch)+'&target='+encodeURIComponent(providerTargetFilter);
+  const list=await api('/api/providers?'+q);
   providerMap = {};
   const tb=document.getElementById('rows'); tb.innerHTML='';
   list.forEach(p=>{
@@ -1241,6 +1344,31 @@ async function delP(id){
   await api('/api/providers/'+id,{method:'DELETE'});
   if(editId === id) cancelEdit();
   await loadProviders();
+}
+
+function applyProviderFilter(){
+  providerSearch = (document.getElementById('providerSearch').value || '').trim();
+  providerTargetFilter = (document.getElementById('providerTargetFilter').value || '').trim();
+  loadProviders();
+}
+
+function clearProviderFilter(){
+  providerSearch = '';
+  providerTargetFilter = '';
+  document.getElementById('providerSearch').value = '';
+  document.getElementById('providerTargetFilter').value = '';
+  loadProviders();
+}
+
+async function importProviders(){
+  const raw = (document.getElementById('importJson').value || '').trim();
+  if(!raw){ alert('请先粘贴 JSON'); return; }
+  let obj;
+  try{ obj = JSON.parse(raw); }catch(e){ alert('JSON 格式错误: '+e.message); return; }
+  const r = await api('/api/providers/import',{method:'POST',body:JSON.stringify(obj)});
+  alert('导入完成: '+(r.imported||0));
+  await loadProviders();
+  await loadOpAudits();
 }
 
 async function loadBackups(){
