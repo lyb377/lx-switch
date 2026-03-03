@@ -57,6 +57,15 @@ type ActivateReq struct {
 	ProviderID int64 `json:"providerId"`
 }
 
+type LoginAudit struct {
+	ID        int64     `json:"id"`
+	IP        string    `json:"ip"`
+	UserAgent string    `json:"userAgent"`
+	Success   bool      `json:"success"`
+	Reason    string    `json:"reason"`
+	CreatedAt time.Time `json:"createdAt"`
+}
+
 type SaveReq struct {
 	Name    string `json:"name"`
 	Target  string `json:"target"`
@@ -114,6 +123,7 @@ func main() {
 	mux.HandleFunc("/api/backups", app.withAuth(app.handleBackups))
 	mux.HandleFunc("/api/rollback", app.withAuth(app.handleRollback))
 	mux.HandleFunc("/api/meta", app.withAuth(app.handleMeta))
+	mux.HandleFunc("/api/login-audits", app.withAuth(app.handleLoginAudits))
 
 	srv := &http.Server{Addr: listen, Handler: logging(mux)}
 	log.Printf("lx-switch listening on %s, data=%s", listen, dataDir)
@@ -139,6 +149,14 @@ CREATE TABLE IF NOT EXISTS providers (
 CREATE TABLE IF NOT EXISTS state (
   k TEXT PRIMARY KEY,
   v TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS login_audits (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  ip TEXT,
+  user_agent TEXT,
+  success INTEGER NOT NULL,
+  reason TEXT,
+  created_at TEXT NOT NULL
 );
 `
 	_, err := a.db.Exec(schema)
@@ -193,7 +211,9 @@ func (a *App) handleLogin(w http.ResponseWriter, r *http.Request) {
 	}
 
 	ip := clientIP(r)
+	ua := strings.TrimSpace(r.UserAgent())
 	if wait, blocked := a.isBlocked(ip); blocked {
+		_ = a.insertLoginAudit(ip, ua, false, "locked")
 		retry := int(wait.Seconds()) + 1
 		w.Header().Set("Retry-After", strconv.Itoa(retry))
 		w.Header().Set("Content-Type", "text/html; charset=utf-8")
@@ -215,6 +235,7 @@ func (a *App) handleLogin(w http.ResponseWriter, r *http.Request) {
 	t := strings.TrimSpace(r.FormValue("token"))
 	if t != a.adminToken {
 		remain, locked := a.recordFailure(ip)
+		_ = a.insertLoginAudit(ip, ua, false, "bad_token")
 		status := http.StatusUnauthorized
 		errMsg := "token 错误"
 		if locked {
@@ -230,6 +251,7 @@ func (a *App) handleLogin(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	a.clearFailures(ip)
+	_ = a.insertLoginAudit(ip, ua, true, "ok")
 	secure := a.requestSecure(r)
 	http.SetCookie(w, &http.Cookie{
 		Name:     "lx_token",
@@ -349,6 +371,31 @@ func (a *App) handleMeta(w http.ResponseWriter, r *http.Request) {
 		"firstRun":       cnt == 0,
 		"tokenWeak":      a.adminToken == "change-me-please",
 	})
+}
+
+func (a *App) handleLoginAudits(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		w.WriteHeader(http.StatusMethodNotAllowed)
+		return
+	}
+	limit := 50
+	if raw := strings.TrimSpace(r.URL.Query().Get("limit")); raw != "" {
+		if n, err := strconv.Atoi(raw); err == nil {
+			if n < 1 {
+				n = 1
+			}
+			if n > 200 {
+				n = 200
+			}
+			limit = n
+		}
+	}
+	list, err := a.listLoginAudits(limit)
+	if err != nil {
+		http.Error(w, err.Error(), 500)
+		return
+	}
+	_ = json.NewEncoder(w).Encode(list)
 }
 
 func (a *App) handleProviders(w http.ResponseWriter, r *http.Request) {
@@ -536,6 +583,37 @@ func (a *App) countProviders() (int, error) {
 	return n, err
 }
 
+func (a *App) insertLoginAudit(ip, ua string, success bool, reason string) error {
+	s := 0
+	if success {
+		s = 1
+	}
+	_, err := a.db.Exec(`INSERT INTO login_audits(ip,user_agent,success,reason,created_at) VALUES(?,?,?,?,?)`,
+		ip, ua, s, reason, time.Now().Format(time.RFC3339))
+	return err
+}
+
+func (a *App) listLoginAudits(limit int) ([]LoginAudit, error) {
+	rows, err := a.db.Query(`SELECT id,ip,user_agent,success,reason,created_at FROM login_audits ORDER BY id DESC LIMIT ?`, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []LoginAudit
+	for rows.Next() {
+		var it LoginAudit
+		var ok int
+		var ts string
+		if err := rows.Scan(&it.ID, &it.IP, &it.UserAgent, &ok, &it.Reason, &ts); err != nil {
+			return nil, err
+		}
+		it.Success = ok == 1
+		it.CreatedAt, _ = time.Parse(time.RFC3339, ts)
+		out = append(out, it)
+	}
+	return out, nil
+}
+
 func (a *App) listProviders() ([]Provider, error) {
 	rows, err := a.db.Query(`SELECT id,name,target,base_url,api_key,model,notes,created_at,updated_at FROM providers ORDER BY id DESC`)
 	if err != nil {
@@ -718,6 +796,7 @@ const indexHTML = `<!doctype html>
     .muted{color:#666;font-size:12px}
     table{width:100%;border-collapse:collapse} td,th{border-bottom:1px solid #eee;padding:8px;text-align:left}
     .actions button{width:auto;margin-right:6px}
+    .actions .ghost{background:#f3f4f6}
     .warn{background:#fff7ed;border:1px solid #fdba74;color:#9a3412;padding:10px;border-radius:8px;margin:10px 0}
     .ok{background:#ecfeff;border:1px solid #67e8f9;color:#155e75;padding:10px;border-radius:8px;margin:10px 0}
     .hide{display:none}
@@ -738,7 +817,7 @@ const indexHTML = `<!doctype html>
   </div>
 
   <div class="card">
-    <h3>新增 Provider</h3>
+    <h3 id="editorTitle">新增 Provider</h3>
     <div class="row">
       <div><label>Name</label><input id="name"/></div>
       <div><label>Target</label>
@@ -753,7 +832,10 @@ const indexHTML = `<!doctype html>
     </div>
     <label>API Key</label><input id="apiKey"/>
     <label>Notes</label><textarea id="notes"></textarea>
-    <button onclick="createProvider()">保存</button>
+    <div class="actions">
+      <button onclick="saveProvider()">保存</button>
+      <button class="ghost" id="cancelEditBtn" onclick="cancelEdit()" style="display:none">取消编辑</button>
+    </div>
   </div>
 
   <div class="card">
@@ -767,10 +849,60 @@ const indexHTML = `<!doctype html>
     <table><thead><tr><th>Name</th><th>Size</th><th>操作</th></tr></thead><tbody id="backs"></tbody></table>
   </div>
 
+  <div class="card">
+    <h3>登录审计</h3>
+    <button onclick="loadAudits()">刷新审计日志</button>
+    <table><thead><tr><th>时间</th><th>IP</th><th>结果</th><th>原因</th><th>UA</th></tr></thead><tbody id="audits"></tbody></table>
+  </div>
+
 <script>
+let editId = null;
+let providerMap = {};
+
 function H(){ return {'Content-Type':'application/json'}; }
 async function api(url,opt={}){ const r=await fetch(url,{...opt,credentials:'same-origin',headers:{...(opt.headers||{}),...H()}}); if(!r.ok) throw new Error(await r.text()); return r.json(); }
 function setBox(id,msg){ const el=document.getElementById(id); if(!el) return; if(!msg){el.classList.add('hide');el.textContent='';return;} el.textContent=msg; el.classList.remove('hide'); }
+function v(id){return document.getElementById(id).value}
+function setV(id,val){ document.getElementById(id).value = val || ''; }
+function resetForm(){ ['name','target','baseUrl','apiKey','model','notes'].forEach(k=>setV(k,'')); document.getElementById('target').value='openclaw'; }
+
+function startEdit(id){
+  const p = providerMap[id];
+  if(!p) return;
+  editId = id;
+  document.getElementById('editorTitle').textContent = '编辑 Provider #' + id;
+  document.getElementById('cancelEditBtn').style.display = '';
+  setV('name', p.name);
+  setV('target', p.target);
+  setV('baseUrl', p.baseUrl);
+  setV('apiKey', p.apiKey);
+  setV('model', p.model);
+  setV('notes', p.notes);
+  window.scrollTo({top:0,behavior:'smooth'});
+}
+
+function cancelEdit(){
+  editId = null;
+  document.getElementById('editorTitle').textContent = '新增 Provider';
+  document.getElementById('cancelEditBtn').style.display = 'none';
+  resetForm();
+}
+
+async function saveProvider(){
+  const body={
+    name:v('name'),target:v('target'),baseUrl:v('baseUrl'),apiKey:v('apiKey'),model:v('model'),notes:v('notes')
+  };
+  if(editId){
+    await api('/api/providers/'+editId,{method:'PUT',body:JSON.stringify(body)});
+    alert('已更新');
+  }else{
+    await api('/api/providers',{method:'POST',body:JSON.stringify(body)});
+    alert('已保存');
+  }
+  cancelEdit();
+  await loadProviders();
+}
+
 async function loadMeta(){
   const m=await api('/api/meta');
   if(m.firstRun){
@@ -784,32 +916,36 @@ async function loadMeta(){
     setBox('weakToken','');
   }
 }
-async function loadAll(){ await loadMeta(); await loadProviders(); await loadBackups(); }
-async function createProvider(){
-  const body={
-    name:v('name'),target:v('target'),baseUrl:v('baseUrl'),apiKey:v('apiKey'),model:v('model'),notes:v('notes')
-  };
-  await api('/api/providers',{method:'POST',body:JSON.stringify(body)}); alert('已保存'); await loadProviders();
-}
-function v(id){return document.getElementById(id).value}
+
 async function loadProviders(){
   const list=await api('/api/providers');
+  providerMap = {};
   const tb=document.getElementById('rows'); tb.innerHTML='';
   list.forEach(p=>{
+    providerMap[p.id] = p;
     const tr=document.createElement('tr');
     tr.innerHTML='<td>'+p.id+'</td><td>'+p.name+'</td><td>'+p.target+'</td><td>'+(p.model||'')+'</td><td class="actions">'
       + '<button onclick="activate('+p.id+')">激活</button>'
+      + '<button class="ghost" onclick="startEdit('+p.id+')">编辑</button>'
       + '<button onclick="delP('+p.id+')">删除</button>'
       + '</td>';
     tb.appendChild(tr);
   });
 }
+
 async function activate(id){
   const r=await api('/api/activate',{method:'POST',body:JSON.stringify({providerId:id})});
   alert('已激活，备份: '+r.backup);
   await loadBackups();
 }
-async function delP(id){ if(!confirm('确定删除?')) return; await api('/api/providers/'+id,{method:'DELETE'}); await loadProviders(); }
+
+async function delP(id){
+  if(!confirm('确定删除?')) return;
+  await api('/api/providers/'+id,{method:'DELETE'});
+  if(editId === id) cancelEdit();
+  await loadProviders();
+}
+
 async function loadBackups(){
   const list=await api('/api/backups');
   const tb=document.getElementById('backs'); tb.innerHTML='';
@@ -819,7 +955,32 @@ async function loadBackups(){
     tb.appendChild(tr);
   });
 }
-async function rollback(name){ if(!confirm('回滚到 '+name+' ?')) return; await api('/api/rollback',{method:'POST',body:JSON.stringify({name})}); alert('回滚完成'); }
+
+async function rollback(name){
+  if(!confirm('回滚到 '+name+' ?')) return;
+  await api('/api/rollback',{method:'POST',body:JSON.stringify({name})});
+  alert('回滚完成');
+}
+
+async function loadAudits(){
+  const list=await api('/api/login-audits?limit=50');
+  const tb=document.getElementById('audits'); tb.innerHTML='';
+  list.forEach(a=>{
+    const tr=document.createElement('tr');
+    const ua=(a.userAgent||'').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+    tr.innerHTML='<td>'+(a.createdAt||'')+'</td><td>'+(a.ip||'')+'</td><td>'+(a.success?'成功':'失败')+'</td><td>'+(a.reason||'')+'</td><td>'+ua+'</td>';
+    tb.appendChild(tr);
+  });
+}
+
+async function loadAll(){
+  cancelEdit();
+  await loadMeta();
+  await loadProviders();
+  await loadBackups();
+  await loadAudits();
+}
+
 window.addEventListener('DOMContentLoaded', loadAll);
 </script>
 </body></html>`
