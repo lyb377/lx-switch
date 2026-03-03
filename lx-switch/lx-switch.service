@@ -1,0 +1,17 @@
+[Unit]
+Description=LX Switch (Server Edition)
+After=network.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/root/.openclaw/workspace/lx-switch
+Environment=LX_SWITCH_LISTEN=:18777
+Environment=LX_SWITCH_DATA_DIR=/var/lib/lx-switch
+Environment=LX_SWITCH_TOKEN=change-me-please
+ExecStart=/root/.openclaw/workspace/lx-switch/lx-switch
+Restart=always
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target
