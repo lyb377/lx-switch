@@ -10,6 +10,7 @@ import (
 	"log"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
 	"sort"
@@ -124,6 +125,7 @@ func main() {
 	mux.HandleFunc("/api/rollback", app.withAuth(app.handleRollback))
 	mux.HandleFunc("/api/meta", app.withAuth(app.handleMeta))
 	mux.HandleFunc("/api/login-audits", app.withAuth(app.handleLoginAudits))
+	mux.HandleFunc("/api/login-audits/export", app.withAuth(app.handleLoginAuditsExport))
 
 	srv := &http.Server{Addr: listen, Handler: logging(mux)}
 	log.Printf("lx-switch listening on %s, data=%s", listen, dataDir)
@@ -378,24 +380,55 @@ func (a *App) handleLoginAudits(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusMethodNotAllowed)
 		return
 	}
-	limit := 50
-	if raw := strings.TrimSpace(r.URL.Query().Get("limit")); raw != "" {
-		if n, err := strconv.Atoi(raw); err == nil {
-			if n < 1 {
-				n = 1
-			}
-			if n > 200 {
-				n = 200
-			}
-			limit = n
-		}
-	}
-	list, err := a.listLoginAudits(limit)
+	limit := parseIntRange(r.URL.Query().Get("limit"), 50, 1, 200)
+	offset := parseIntRange(r.URL.Query().Get("offset"), 0, 0, 1_000_000)
+	list, err := a.listLoginAudits(limit, offset)
 	if err != nil {
 		http.Error(w, err.Error(), 500)
 		return
 	}
-	_ = json.NewEncoder(w).Encode(list)
+	total, err := a.countLoginAudits()
+	if err != nil {
+		http.Error(w, err.Error(), 500)
+		return
+	}
+	_ = json.NewEncoder(w).Encode(map[string]any{
+		"items":  list,
+		"total":  total,
+		"limit":  limit,
+		"offset": offset,
+	})
+}
+
+func (a *App) handleLoginAuditsExport(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		w.WriteHeader(http.StatusMethodNotAllowed)
+		return
+	}
+	limit := parseIntRange(r.URL.Query().Get("limit"), 500, 1, 5000)
+	list, err := a.listLoginAudits(limit, 0)
+	if err != nil {
+		http.Error(w, err.Error(), 500)
+		return
+	}
+	w.Header().Set("Content-Type", "text/csv; charset=utf-8")
+	w.Header().Set("Content-Disposition", fmt.Sprintf("attachment; filename=login-audits-%s.csv", time.Now().Format("20060102-150405")))
+	_, _ = io.WriteString(w, "id,created_at,ip,success,reason,user_agent\n")
+	for _, it := range list {
+		success := "0"
+		if it.Success {
+			success = "1"
+		}
+		line := fmt.Sprintf("%d,%s,%s,%s,%s,%s\n",
+			it.ID,
+			csvEsc(it.CreatedAt.Format(time.RFC3339)),
+			csvEsc(it.IP),
+			success,
+			csvEsc(it.Reason),
+			csvEsc(it.UserAgent),
+		)
+		_, _ = io.WriteString(w, line)
+	}
 }
 
 func (a *App) handleProviders(w http.ResponseWriter, r *http.Request) {
@@ -413,8 +446,8 @@ func (a *App) handleProviders(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, err.Error(), 400)
 			return
 		}
-		if strings.TrimSpace(req.Name) == "" || strings.TrimSpace(req.Target) == "" {
-			http.Error(w, "name/target required", 400)
+		if err := validateSaveReq(&req); err != nil {
+			http.Error(w, err.Error(), 400)
 			return
 		}
 		now := time.Now().Format(time.RFC3339)
@@ -450,8 +483,8 @@ func (a *App) handleProviderByID(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, err.Error(), 400)
 			return
 		}
-		if strings.TrimSpace(req.Name) == "" || strings.TrimSpace(req.Target) == "" {
-			http.Error(w, "name/target required", 400)
+		if err := validateSaveReq(&req); err != nil {
+			http.Error(w, err.Error(), 400)
 			return
 		}
 		_, err := a.db.Exec(`UPDATE providers SET name=?,target=?,base_url=?,api_key=?,model=?,notes=?,updated_at=? WHERE id=?`,
@@ -593,8 +626,14 @@ func (a *App) insertLoginAudit(ip, ua string, success bool, reason string) error
 	return err
 }
 
-func (a *App) listLoginAudits(limit int) ([]LoginAudit, error) {
-	rows, err := a.db.Query(`SELECT id,ip,user_agent,success,reason,created_at FROM login_audits ORDER BY id DESC LIMIT ?`, limit)
+func (a *App) countLoginAudits() (int, error) {
+	var n int
+	err := a.db.QueryRow(`SELECT COUNT(1) FROM login_audits`).Scan(&n)
+	return n, err
+}
+
+func (a *App) listLoginAudits(limit, offset int) ([]LoginAudit, error) {
+	rows, err := a.db.Query(`SELECT id,ip,user_agent,success,reason,created_at FROM login_audits ORDER BY id DESC LIMIT ? OFFSET ?`, limit, offset)
 	if err != nil {
 		return nil, err
 	}
@@ -764,6 +803,56 @@ func getenvInt(k string, d int) int {
 	return n
 }
 
+func parseIntRange(raw string, d, min, max int) int {
+	v := strings.TrimSpace(raw)
+	if v == "" {
+		return d
+	}
+	n, err := strconv.Atoi(v)
+	if err != nil {
+		return d
+	}
+	if n < min {
+		n = min
+	}
+	if n > max {
+		n = max
+	}
+	return n
+}
+
+func validateSaveReq(req *SaveReq) error {
+	req.Name = strings.TrimSpace(req.Name)
+	req.Target = strings.TrimSpace(req.Target)
+	req.BaseURL = strings.TrimSpace(req.BaseURL)
+	req.APIKey = strings.TrimSpace(req.APIKey)
+	req.Model = strings.TrimSpace(req.Model)
+	req.Notes = strings.TrimSpace(req.Notes)
+
+	if req.Name == "" || req.Target == "" {
+		return errors.New("name/target required")
+	}
+	if _, err := targetPath(req.Target); err != nil {
+		return err
+	}
+	if req.BaseURL != "" {
+		u, err := url.Parse(req.BaseURL)
+		if err != nil || u.Scheme == "" || u.Host == "" {
+			return errors.New("invalid baseUrl")
+		}
+		s := strings.ToLower(u.Scheme)
+		if s != "http" && s != "https" {
+			return errors.New("baseUrl must start with http:// or https://")
+		}
+	}
+	return nil
+}
+
+func csvEsc(s string) string {
+	s = strings.ReplaceAll(s, `"`, `""`)
+	return `"` + s + `"`
+}
+
 type loginPageData struct {
 	Error       string
 	RetryAfterS int
@@ -851,13 +940,22 @@ const indexHTML = `<!doctype html>
 
   <div class="card">
     <h3>登录审计</h3>
-    <button onclick="loadAudits()">刷新审计日志</button>
+    <div class="actions">
+      <button onclick="prevAuditPage()">上一页</button>
+      <button onclick="nextAuditPage()">下一页</button>
+      <button class="ghost" onclick="loadAudits()">刷新审计日志</button>
+      <button class="ghost" onclick="exportAudits()">导出 CSV</button>
+    </div>
+    <div id="auditPager" class="muted"></div>
     <table><thead><tr><th>时间</th><th>IP</th><th>结果</th><th>原因</th><th>UA</th></tr></thead><tbody id="audits"></tbody></table>
   </div>
 
 <script>
 let editId = null;
 let providerMap = {};
+let auditOffset = 0;
+const auditLimit = 20;
+let auditTotal = 0;
 
 function H(){ return {'Content-Type':'application/json'}; }
 async function api(url,opt={}){ const r=await fetch(url,{...opt,credentials:'same-origin',headers:{...(opt.headers||{}),...H()}}); if(!r.ok) throw new Error(await r.text()); return r.json(); }
@@ -963,14 +1061,35 @@ async function rollback(name){
 }
 
 async function loadAudits(){
-  const list=await api('/api/login-audits?limit=50');
+  const res=await api('/api/login-audits?limit='+auditLimit+'&offset='+auditOffset);
+  const list=res.items||[];
+  auditTotal = res.total||0;
   const tb=document.getElementById('audits'); tb.innerHTML='';
+  const pager=document.getElementById('auditPager');
+  const from = auditTotal===0 ? 0 : (auditOffset+1);
+  const to = Math.min(auditOffset+auditLimit, auditTotal);
+  pager.textContent='审计日志：共 '+auditTotal+' 条，当前 '+from+' - '+to;
   list.forEach(a=>{
     const tr=document.createElement('tr');
     const ua=(a.userAgent||'').replace(/</g,'&lt;').replace(/>/g,'&gt;');
     tr.innerHTML='<td>'+(a.createdAt||'')+'</td><td>'+(a.ip||'')+'</td><td>'+(a.success?'成功':'失败')+'</td><td>'+(a.reason||'')+'</td><td>'+ua+'</td>';
     tb.appendChild(tr);
   });
+}
+
+function prevAuditPage(){
+  auditOffset = Math.max(0, auditOffset - auditLimit);
+  loadAudits();
+}
+
+function nextAuditPage(){
+  if(auditOffset + auditLimit >= auditTotal) return;
+  auditOffset += auditLimit;
+  loadAudits();
+}
+
+function exportAudits(){
+  window.open('/api/login-audits/export?limit=2000','_blank');
 }
 
 async function loadAll(){
