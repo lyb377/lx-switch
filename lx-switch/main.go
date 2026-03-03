@@ -5,23 +5,40 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"html"
 	"io"
 	"log"
+	"net"
 	"net/http"
 	"os"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	_ "github.com/mattn/go-sqlite3"
 )
 
 type App struct {
-	db         *sql.DB
-	dataDir    string
-	backupDir  string
-	adminToken string
+	db                *sql.DB
+	dataDir           string
+	backupDir         string
+	adminToken        string
+	failed            map[string]*attemptState
+	mu                sync.Mutex
+	maxAttempts       int
+	window            time.Duration
+	lockout           time.Duration
+	maxLoginBodyBytes int64
+}
+
+type attemptState struct {
+	Count       int
+	FirstFailed time.Time
+	LockUntil   time.Time
+	LastFailed  time.Time
 }
 
 type Provider struct {
@@ -71,7 +88,17 @@ func main() {
 		log.Fatal(err)
 	}
 
-	app := &App{db: db, dataDir: dataDir, backupDir: backupDir, adminToken: token}
+	app := &App{
+		db:                db,
+		dataDir:           dataDir,
+		backupDir:         backupDir,
+		adminToken:        token,
+		failed:            map[string]*attemptState{},
+		maxAttempts:       getenvInt("LX_SWITCH_MAX_LOGIN_ATTEMPTS", 6),
+		window:            time.Duration(getenvInt("LX_SWITCH_LOGIN_WINDOW_SEC", 300)) * time.Second,
+		lockout:           time.Duration(getenvInt("LX_SWITCH_LOGIN_LOCK_SEC", 900)) * time.Second,
+		maxLoginBodyBytes: int64(getenvInt("LX_SWITCH_LOGIN_MAX_BODY", 4096)),
+	}
 	if err := app.initDB(); err != nil {
 		log.Fatal(err)
 	}
@@ -157,21 +184,53 @@ func (a *App) handleIndex(w http.ResponseWriter, r *http.Request) {
 func (a *App) handleLogin(w http.ResponseWriter, r *http.Request) {
 	if r.Method == http.MethodGet {
 		w.Header().Set("Content-Type", "text/html; charset=utf-8")
-		_, _ = io.WriteString(w, loginHTML)
+		_, _ = io.WriteString(w, renderLoginPage(loginPageData{}))
 		return
 	}
 	if r.Method != http.MethodPost {
 		w.WriteHeader(http.StatusMethodNotAllowed)
 		return
 	}
-	_ = r.ParseForm()
-	t := strings.TrimSpace(r.FormValue("token"))
-	if t != a.adminToken {
-		w.WriteHeader(http.StatusUnauthorized)
-		_, _ = io.WriteString(w, "token 错误")
+
+	ip := clientIP(r)
+	if wait, blocked := a.isBlocked(ip); blocked {
+		retry := int(wait.Seconds()) + 1
+		w.Header().Set("Retry-After", strconv.Itoa(retry))
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		w.WriteHeader(http.StatusTooManyRequests)
+		_, _ = io.WriteString(w, renderLoginPage(loginPageData{
+			Error:       "登录尝试过多，请稍后再试",
+			RetryAfterS: retry,
+		}))
 		return
 	}
-	secure := r.TLS != nil || strings.EqualFold(r.Header.Get("X-Forwarded-Proto"), "https")
+
+	r.Body = http.MaxBytesReader(w, r.Body, a.maxLoginBodyBytes)
+	if err := r.ParseForm(); err != nil {
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		w.WriteHeader(http.StatusBadRequest)
+		_, _ = io.WriteString(w, renderLoginPage(loginPageData{Error: "请求格式不正确"}))
+		return
+	}
+	t := strings.TrimSpace(r.FormValue("token"))
+	if t != a.adminToken {
+		remain, locked := a.recordFailure(ip)
+		status := http.StatusUnauthorized
+		errMsg := "token 错误"
+		if locked {
+			status = http.StatusTooManyRequests
+			errMsg = "登录尝试过多，请稍后再试"
+		}
+		if status == http.StatusTooManyRequests && remain > 0 {
+			w.Header().Set("Retry-After", strconv.Itoa(remain))
+		}
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		w.WriteHeader(status)
+		_, _ = io.WriteString(w, renderLoginPage(loginPageData{Error: errMsg, RetryAfterS: remain}))
+		return
+	}
+	a.clearFailures(ip)
+	secure := a.requestSecure(r)
 	http.SetCookie(w, &http.Cookie{
 		Name:     "lx_token",
 		Value:    t,
@@ -190,11 +249,91 @@ func (a *App) handleLogout(w http.ResponseWriter, r *http.Request) {
 		Value:    "",
 		Path:     "/",
 		HttpOnly: true,
-		Secure:   false,
+		Secure:   a.requestSecure(r),
 		SameSite: http.SameSiteLaxMode,
 		MaxAge:   -1,
 	})
 	http.Redirect(w, r, "/login", http.StatusFound)
+}
+
+func (a *App) requestSecure(r *http.Request) bool {
+	if r.TLS != nil {
+		return true
+	}
+	if strings.EqualFold(r.Header.Get("X-Forwarded-Proto"), "https") {
+		return true
+	}
+	if strings.EqualFold(r.Header.Get("X-Forwarded-Ssl"), "on") {
+		return true
+	}
+	return false
+}
+
+func clientIP(r *http.Request) string {
+	xff := strings.TrimSpace(strings.Split(r.Header.Get("X-Forwarded-For"), ",")[0])
+	if xff != "" {
+		if ip := net.ParseIP(xff); ip != nil {
+			return ip.String()
+		}
+	}
+	h, _, err := net.SplitHostPort(strings.TrimSpace(r.RemoteAddr))
+	if err == nil {
+		if ip := net.ParseIP(h); ip != nil {
+			return ip.String()
+		}
+	}
+	return strings.TrimSpace(r.RemoteAddr)
+}
+
+func (a *App) isBlocked(ip string) (time.Duration, bool) {
+	if strings.TrimSpace(ip) == "" {
+		return 0, false
+	}
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	now := time.Now()
+	st, ok := a.failed[ip]
+	if !ok {
+		return 0, false
+	}
+	if st.LockUntil.After(now) {
+		return time.Until(st.LockUntil), true
+	}
+	if st.LastFailed.Add(a.window).Before(now) {
+		delete(a.failed, ip)
+	}
+	return 0, false
+}
+
+func (a *App) recordFailure(ip string) (retryAfterS int, locked bool) {
+	if strings.TrimSpace(ip) == "" {
+		return 0, false
+	}
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	now := time.Now()
+	st, ok := a.failed[ip]
+	if !ok || st.LastFailed.Add(a.window).Before(now) {
+		st = &attemptState{Count: 1, FirstFailed: now, LastFailed: now}
+		a.failed[ip] = st
+		return 0, false
+	}
+	st.Count++
+	st.LastFailed = now
+	if st.Count >= a.maxAttempts {
+		st.LockUntil = now.Add(a.lockout)
+		return int(a.lockout.Seconds()) + 1, true
+	}
+	return 0, false
+}
+
+func (a *App) clearFailures(ip string) {
+	if strings.TrimSpace(ip) == "" {
+		return
+	}
+	a.mu.Lock()
+	delete(a.failed, ip)
+	a.mu.Unlock()
 }
 
 func (a *App) handleHealth(w http.ResponseWriter, r *http.Request) {
@@ -203,7 +342,13 @@ func (a *App) handleHealth(w http.ResponseWriter, r *http.Request) {
 
 func (a *App) handleMeta(w http.ResponseWriter, r *http.Request) {
 	active, _ := a.getState("active_provider")
-	_ = json.NewEncoder(w).Encode(map[string]any{"activeProvider": active})
+	cnt, _ := a.countProviders()
+	_ = json.NewEncoder(w).Encode(map[string]any{
+		"activeProvider": active,
+		"providerCount":  cnt,
+		"firstRun":       cnt == 0,
+		"tokenWeak":      a.adminToken == "change-me-please",
+	})
 }
 
 func (a *App) handleProviders(w http.ResponseWriter, r *http.Request) {
@@ -345,7 +490,9 @@ func (a *App) handleRollback(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusMethodNotAllowed)
 		return
 	}
-	var req struct { Name string `json:"name"` }
+	var req struct {
+		Name string `json:"name"`
+	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		http.Error(w, err.Error(), 400)
 		return
@@ -383,41 +530,55 @@ func (a *App) handleRollback(w http.ResponseWriter, r *http.Request) {
 	_ = json.NewEncoder(w).Encode(map[string]any{"ok": true, "restored": dst})
 }
 
+func (a *App) countProviders() (int, error) {
+	var n int
+	err := a.db.QueryRow(`SELECT COUNT(1) FROM providers`).Scan(&n)
+	return n, err
+}
+
 func (a *App) listProviders() ([]Provider, error) {
 	rows, err := a.db.Query(`SELECT id,name,target,base_url,api_key,model,notes,created_at,updated_at FROM providers ORDER BY id DESC`)
-	if err != nil { return nil, err }
+	if err != nil {
+		return nil, err
+	}
 	defer rows.Close()
 	var out []Provider
 	for rows.Next() {
 		var p Provider
-		var c,u string
-		if err := rows.Scan(&p.ID,&p.Name,&p.Target,&p.BaseURL,&p.APIKey,&p.Model,&p.Notes,&c,&u); err != nil { return nil, err }
-		p.CreatedAt,_ = time.Parse(time.RFC3339,c)
-		p.UpdatedAt,_ = time.Parse(time.RFC3339,u)
-		out = append(out,p)
+		var c, u string
+		if err := rows.Scan(&p.ID, &p.Name, &p.Target, &p.BaseURL, &p.APIKey, &p.Model, &p.Notes, &c, &u); err != nil {
+			return nil, err
+		}
+		p.CreatedAt, _ = time.Parse(time.RFC3339, c)
+		p.UpdatedAt, _ = time.Parse(time.RFC3339, u)
+		out = append(out, p)
 	}
-	return out,nil
+	return out, nil
 }
 
 func (a *App) getProvider(id int64) (*Provider, error) {
 	var p Provider
-	var c,u string
+	var c, u string
 	err := a.db.QueryRow(`SELECT id,name,target,base_url,api_key,model,notes,created_at,updated_at FROM providers WHERE id=?`, id).
-		Scan(&p.ID,&p.Name,&p.Target,&p.BaseURL,&p.APIKey,&p.Model,&p.Notes,&c,&u)
-	if err != nil { return nil, err }
-	p.CreatedAt,_ = time.Parse(time.RFC3339,c)
-	p.UpdatedAt,_ = time.Parse(time.RFC3339,u)
-	return &p,nil
+		Scan(&p.ID, &p.Name, &p.Target, &p.BaseURL, &p.APIKey, &p.Model, &p.Notes, &c, &u)
+	if err != nil {
+		return nil, err
+	}
+	p.CreatedAt, _ = time.Parse(time.RFC3339, c)
+	p.UpdatedAt, _ = time.Parse(time.RFC3339, u)
+	return &p, nil
 }
 
-func (a *App) setState(k,v string) error {
-	_, err := a.db.Exec(`INSERT INTO state(k,v) VALUES(?,?) ON CONFLICT(k) DO UPDATE SET v=excluded.v`, k,v)
+func (a *App) setState(k, v string) error {
+	_, err := a.db.Exec(`INSERT INTO state(k,v) VALUES(?,?) ON CONFLICT(k) DO UPDATE SET v=excluded.v`, k, v)
 	return err
 }
-func (a *App) getState(k string) (string,error) {
+func (a *App) getState(k string) (string, error) {
 	var v string
 	err := a.db.QueryRow(`SELECT v FROM state WHERE k=?`, k).Scan(&v)
-	if err == sql.ErrNoRows { return "", nil }
+	if err == sql.ErrNoRows {
+		return "", nil
+	}
 	return v, err
 }
 
@@ -438,7 +599,9 @@ func targetPath(target string) (string, error) {
 
 func (a *App) backupTargetConfig(target, stamp string) (string, error) {
 	src, err := targetPath(target)
-	if err != nil { return "", err }
+	if err != nil {
+		return "", err
+	}
 	name := fmt.Sprintf("%s__%s.bak", target, stamp)
 	dst := filepath.Join(a.backupDir, name)
 	b, err := os.ReadFile(src)
@@ -449,32 +612,46 @@ func (a *App) backupTargetConfig(target, stamp string) (string, error) {
 		}
 		return "", err
 	}
-	if err := os.WriteFile(dst, b, 0o600); err != nil { return "", err }
+	if err := os.WriteFile(dst, b, 0o600); err != nil {
+		return "", err
+	}
 	return name, nil
 }
 
 func (a *App) writeTargetConfig(p *Provider) error {
 	dst, err := targetPath(p.Target)
-	if err != nil { return err }
-	if err := os.MkdirAll(filepath.Dir(dst), 0o755); err != nil { return err }
+	if err != nil {
+		return err
+	}
+	if err := os.MkdirAll(filepath.Dir(dst), 0o755); err != nil {
+		return err
+	}
 
 	switch p.Target {
 	case "codex":
 		content := ""
-		if p.BaseURL != "" { content += fmt.Sprintf("base_url = \"%s\"\n", p.BaseURL) }
-		if p.APIKey != "" { content += fmt.Sprintf("api_key = \"%s\"\n", p.APIKey) }
-		if p.Model != "" { content += fmt.Sprintf("model = \"%s\"\n", p.Model) }
-		if content == "" { content = "# managed by lx-switch\n" }
+		if p.BaseURL != "" {
+			content += fmt.Sprintf("base_url = \"%s\"\n", p.BaseURL)
+		}
+		if p.APIKey != "" {
+			content += fmt.Sprintf("api_key = \"%s\"\n", p.APIKey)
+		}
+		if p.Model != "" {
+			content += fmt.Sprintf("model = \"%s\"\n", p.Model)
+		}
+		if content == "" {
+			content = "# managed by lx-switch\n"
+		}
 		return os.WriteFile(dst, []byte(content), 0o600)
 	default:
 		m := map[string]any{
 			"managedBy": "lx-switch",
-			"name": p.Name,
-			"target": p.Target,
-			"baseUrl": p.BaseURL,
-			"apiKey": p.APIKey,
-			"model": p.Model,
-			"notes": p.Notes,
+			"name":      p.Name,
+			"target":    p.Target,
+			"baseUrl":   p.BaseURL,
+			"apiKey":    p.APIKey,
+			"model":     p.Model,
+			"notes":     p.Notes,
 			"updatedAt": time.Now().Format(time.RFC3339),
 		}
 		b, _ := json.MarshalIndent(m, "", "  ")
@@ -485,12 +662,47 @@ func (a *App) writeTargetConfig(p *Provider) error {
 func logging(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		start := time.Now()
-		next.ServeHTTP(w,r)
+		next.ServeHTTP(w, r)
 		log.Printf("%s %s %s", r.Method, r.URL.Path, time.Since(start))
 	})
 }
 
-func getenv(k, d string) string { if v := os.Getenv(k); v != "" { return v }; return d }
+func getenv(k, d string) string {
+	if v := os.Getenv(k); v != "" {
+		return v
+	}
+	return d
+}
+
+func getenvInt(k string, d int) int {
+	v := strings.TrimSpace(os.Getenv(k))
+	if v == "" {
+		return d
+	}
+	n, err := strconv.Atoi(v)
+	if err != nil {
+		return d
+	}
+	return n
+}
+
+type loginPageData struct {
+	Error       string
+	RetryAfterS int
+}
+
+func renderLoginPage(d loginPageData) string {
+	errBlock := ""
+	if d.Error != "" {
+		msg := html.EscapeString(d.Error)
+		retry := ""
+		if d.RetryAfterS > 0 {
+			retry = fmt.Sprintf("（约 %d 秒后可重试）", d.RetryAfterS)
+		}
+		errBlock = fmt.Sprintf(`<div class="err">%s %s</div>`, msg, retry)
+	}
+	return strings.ReplaceAll(loginHTML, "{{ERROR_BLOCK}}", errBlock)
+}
 
 const indexHTML = `<!doctype html>
 <html>
@@ -506,11 +718,17 @@ const indexHTML = `<!doctype html>
     .muted{color:#666;font-size:12px}
     table{width:100%;border-collapse:collapse} td,th{border-bottom:1px solid #eee;padding:8px;text-align:left}
     .actions button{width:auto;margin-right:6px}
+    .warn{background:#fff7ed;border:1px solid #fdba74;color:#9a3412;padding:10px;border-radius:8px;margin:10px 0}
+    .ok{background:#ecfeff;border:1px solid #67e8f9;color:#155e75;padding:10px;border-radius:8px;margin:10px 0}
+    .hide{display:none}
   </style>
 </head>
 <body>
-  <h2>LX Switch v0.1</h2>
+  <h2>LX Switch v0.2</h2>
   <p class="muted">Server-native switch panel for Claude/Codex/OpenClaw/Gemini</p>
+
+  <div id="firstRun" class="ok hide"></div>
+  <div id="weakToken" class="warn hide"></div>
 
   <div class="card">
     <div style="display:flex;justify-content:space-between;align-items:center;gap:10px;">
@@ -552,7 +770,21 @@ const indexHTML = `<!doctype html>
 <script>
 function H(){ return {'Content-Type':'application/json'}; }
 async function api(url,opt={}){ const r=await fetch(url,{...opt,credentials:'same-origin',headers:{...(opt.headers||{}),...H()}}); if(!r.ok) throw new Error(await r.text()); return r.json(); }
-async function loadAll(){ await loadProviders(); await loadBackups(); }
+function setBox(id,msg){ const el=document.getElementById(id); if(!el) return; if(!msg){el.classList.add('hide');el.textContent='';return;} el.textContent=msg; el.classList.remove('hide'); }
+async function loadMeta(){
+  const m=await api('/api/meta');
+  if(m.firstRun){
+    setBox('firstRun','首次使用引导：1) 先新增一个 Provider；2) 点击“激活”写入目标配置；3) 如需回退可在 Backups 里回滚。');
+  }else{
+    setBox('firstRun','');
+  }
+  if(m.tokenWeak){
+    setBox('weakToken','检测到默认 Token（change-me-please），强烈建议尽快在 systemd 环境变量里修改 LX_SWITCH_TOKEN。');
+  }else{
+    setBox('weakToken','');
+  }
+}
+async function loadAll(){ await loadMeta(); await loadProviders(); await loadBackups(); }
 async function createProvider(){
   const body={
     name:v('name'),target:v('target'),baseUrl:v('baseUrl'),apiKey:v('apiKey'),model:v('model'),notes:v('notes')
@@ -603,12 +835,14 @@ const loginHTML = `<!doctype html>
     .wrap{max-width:420px;margin:80px auto;background:#fff;border:1px solid #e5e7eb;border-radius:12px;padding:20px}
     input,button{width:100%;padding:10px;margin-top:10px}
     .muted{font-size:12px;color:#666}
+    .err{margin-top:10px;padding:10px;border-radius:8px;background:#fef2f2;border:1px solid #fecaca;color:#991b1b;font-size:14px}
   </style>
 </head>
 <body>
   <div class="wrap">
     <h3>LX Switch 登录</h3>
     <p class="muted">输入管理员 Token 进入面板</p>
+    {{ERROR_BLOCK}}
     <form method="post" action="/login">
       <input type="password" name="token" placeholder="Admin Token" required />
       <button type="submit">登录</button>
