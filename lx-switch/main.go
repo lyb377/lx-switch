@@ -67,6 +67,13 @@ type LoginAudit struct {
 	CreatedAt time.Time `json:"createdAt"`
 }
 
+type OpAuditQuery struct {
+	Limit  int
+	Offset int
+	Action string
+	Target string
+}
+
 type OpAudit struct {
 	ID        int64     `json:"id"`
 	Action    string    `json:"action"`
@@ -137,6 +144,7 @@ func main() {
 	mux.HandleFunc("/api/login-audits", app.withAuth(app.handleLoginAudits))
 	mux.HandleFunc("/api/login-audits/export", app.withAuth(app.handleLoginAuditsExport))
 	mux.HandleFunc("/api/op-audits", app.withAuth(app.handleOpAudits))
+	mux.HandleFunc("/api/op-audits/export", app.withAuth(app.handleOpAuditsExport))
 
 	srv := &http.Server{Addr: listen, Handler: logging(mux)}
 	log.Printf("lx-switch listening on %s, data=%s", listen, dataDir)
@@ -456,14 +464,13 @@ func (a *App) handleOpAudits(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusMethodNotAllowed)
 		return
 	}
-	limit := parseIntRange(r.URL.Query().Get("limit"), 50, 1, 200)
-	offset := parseIntRange(r.URL.Query().Get("offset"), 0, 0, 1_000_000)
-	list, err := a.listOpAudits(limit, offset)
+	q := parseOpAuditQuery(r)
+	list, err := a.listOpAudits(q)
 	if err != nil {
 		http.Error(w, err.Error(), 500)
 		return
 	}
-	total, err := a.countOpAudits()
+	total, err := a.countOpAudits(q)
 	if err != nil {
 		http.Error(w, err.Error(), 500)
 		return
@@ -471,9 +478,41 @@ func (a *App) handleOpAudits(w http.ResponseWriter, r *http.Request) {
 	_ = json.NewEncoder(w).Encode(map[string]any{
 		"items":  list,
 		"total":  total,
-		"limit":  limit,
-		"offset": offset,
+		"limit":  q.Limit,
+		"offset": q.Offset,
+		"action": q.Action,
+		"target": q.Target,
 	})
+}
+
+func (a *App) handleOpAuditsExport(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		w.WriteHeader(http.StatusMethodNotAllowed)
+		return
+	}
+	q := parseOpAuditQuery(r)
+	q.Offset = 0
+	q.Limit = parseIntRange(r.URL.Query().Get("limit"), 500, 1, 5000)
+	list, err := a.listOpAudits(q)
+	if err != nil {
+		http.Error(w, err.Error(), 500)
+		return
+	}
+	w.Header().Set("Content-Type", "text/csv; charset=utf-8")
+	w.Header().Set("Content-Disposition", fmt.Sprintf("attachment; filename=op-audits-%s.csv", time.Now().Format("20060102-150405")))
+	_, _ = io.WriteString(w, "id,created_at,action,target,detail,ip,user_agent\n")
+	for _, it := range list {
+		line := fmt.Sprintf("%d,%s,%s,%s,%s,%s,%s\n",
+			it.ID,
+			csvEsc(it.CreatedAt.Format(time.RFC3339)),
+			csvEsc(it.Action),
+			csvEsc(it.Target),
+			csvEsc(it.Detail),
+			csvEsc(it.IP),
+			csvEsc(it.UserAgent),
+		)
+		_, _ = io.WriteString(w, line)
+	}
 }
 
 func (a *App) handleProviders(w http.ResponseWriter, r *http.Request) {
@@ -716,14 +755,36 @@ func (a *App) insertOpAudit(action, target, detail, ip, ua string) error {
 	return err
 }
 
-func (a *App) countOpAudits() (int, error) {
+func (a *App) countOpAudits(q OpAuditQuery) (int, error) {
 	var n int
-	err := a.db.QueryRow(`SELECT COUNT(1) FROM op_audits`).Scan(&n)
+	query := `SELECT COUNT(1) FROM op_audits WHERE 1=1`
+	args := []any{}
+	if q.Action != "" {
+		query += ` AND action=?`
+		args = append(args, q.Action)
+	}
+	if q.Target != "" {
+		query += ` AND target=?`
+		args = append(args, q.Target)
+	}
+	err := a.db.QueryRow(query, args...).Scan(&n)
 	return n, err
 }
 
-func (a *App) listOpAudits(limit, offset int) ([]OpAudit, error) {
-	rows, err := a.db.Query(`SELECT id,action,target,detail,ip,user_agent,created_at FROM op_audits ORDER BY id DESC LIMIT ? OFFSET ?`, limit, offset)
+func (a *App) listOpAudits(q OpAuditQuery) ([]OpAudit, error) {
+	query := `SELECT id,action,target,detail,ip,user_agent,created_at FROM op_audits WHERE 1=1`
+	args := []any{}
+	if q.Action != "" {
+		query += ` AND action=?`
+		args = append(args, q.Action)
+	}
+	if q.Target != "" {
+		query += ` AND target=?`
+		args = append(args, q.Target)
+	}
+	query += ` ORDER BY id DESC LIMIT ? OFFSET ?`
+	args = append(args, q.Limit, q.Offset)
+	rows, err := a.db.Query(query, args...)
 	if err != nil {
 		return nil, err
 	}
@@ -737,6 +798,9 @@ func (a *App) listOpAudits(limit, offset int) ([]OpAudit, error) {
 		}
 		it.CreatedAt, _ = time.Parse(time.RFC3339, ts)
 		out = append(out, it)
+	}
+	if out == nil {
+		out = []OpAudit{}
 	}
 	return out, nil
 }
@@ -941,6 +1005,22 @@ func csvEsc(s string) string {
 	return `"` + s + `"`
 }
 
+func parseOpAuditQuery(r *http.Request) OpAuditQuery {
+	q := OpAuditQuery{
+		Limit:  parseIntRange(r.URL.Query().Get("limit"), 50, 1, 200),
+		Offset: parseIntRange(r.URL.Query().Get("offset"), 0, 0, 1_000_000),
+		Action: strings.TrimSpace(r.URL.Query().Get("action")),
+		Target: strings.TrimSpace(r.URL.Query().Get("target")),
+	}
+	if len(q.Action) > 64 {
+		q.Action = q.Action[:64]
+	}
+	if len(q.Target) > 64 {
+		q.Target = q.Target[:64]
+	}
+	return q
+}
+
 type loginPageData struct {
 	Error       string
 	RetryAfterS int
@@ -1044,6 +1124,21 @@ const indexHTML = `<!doctype html>
       <button onclick="prevOpPage()">上一页</button>
       <button onclick="nextOpPage()">下一页</button>
       <button class="ghost" onclick="loadOpAudits()">刷新操作日志</button>
+      <button class="ghost" onclick="exportOpAudits()">导出 CSV</button>
+    </div>
+    <div class="row">
+      <div>
+        <label>Action 过滤</label>
+        <input id="opActionFilter" placeholder="例如 provider.activate"/>
+      </div>
+      <div>
+        <label>Target 过滤</label>
+        <input id="opTargetFilter" placeholder="例如 openclaw"/>
+      </div>
+    </div>
+    <div class="actions">
+      <button onclick="applyOpFilter()">应用过滤</button>
+      <button class="ghost" onclick="clearOpFilter()">清空过滤</button>
     </div>
     <div id="opPager" class="muted"></div>
     <table><thead><tr><th>时间</th><th>Action</th><th>Target</th><th>Detail</th><th>IP</th><th>UA</th></tr></thead><tbody id="ops"></tbody></table>
@@ -1058,6 +1153,8 @@ let auditTotal = 0;
 let opOffset = 0;
 const opLimit = 20;
 let opTotal = 0;
+let opActionFilter = '';
+let opTargetFilter = '';
 
 function H(){ return {'Content-Type':'application/json'}; }
 async function api(url,opt={}){ const r=await fetch(url,{...opt,credentials:'same-origin',headers:{...(opt.headers||{}),...H()}}); if(!r.ok) throw new Error(await r.text()); return r.json(); }
@@ -1195,14 +1292,18 @@ function exportAudits(){
 }
 
 async function loadOpAudits(){
-  const res=await api('/api/op-audits?limit='+opLimit+'&offset='+opOffset);
+  const q='limit='+opLimit+'&offset='+opOffset+'&action='+encodeURIComponent(opActionFilter)+'&target='+encodeURIComponent(opTargetFilter);
+  const res=await api('/api/op-audits?'+q);
   const list=res.items||[];
   opTotal = res.total||0;
   const tb=document.getElementById('ops'); tb.innerHTML='';
   const pager=document.getElementById('opPager');
   const from = opTotal===0 ? 0 : (opOffset+1);
   const to = Math.min(opOffset+opLimit, opTotal);
-  pager.textContent='操作日志：共 '+opTotal+' 条，当前 '+from+' - '+to;
+  const f = [];
+  if(opActionFilter) f.push('action='+opActionFilter);
+  if(opTargetFilter) f.push('target='+opTargetFilter);
+  pager.textContent='操作日志：共 '+opTotal+' 条，当前 '+from+' - '+to + (f.length?('，过滤：'+f.join(', ')):'');
   list.forEach(a=>{
     const tr=document.createElement('tr');
     const ua=(a.userAgent||'').replace(/</g,'&lt;').replace(/>/g,'&gt;');
@@ -1220,6 +1321,27 @@ function nextOpPage(){
   if(opOffset + opLimit >= opTotal) return;
   opOffset += opLimit;
   loadOpAudits();
+}
+
+function applyOpFilter(){
+  opActionFilter = (document.getElementById('opActionFilter').value || '').trim();
+  opTargetFilter = (document.getElementById('opTargetFilter').value || '').trim();
+  opOffset = 0;
+  loadOpAudits();
+}
+
+function clearOpFilter(){
+  opActionFilter = '';
+  opTargetFilter = '';
+  document.getElementById('opActionFilter').value = '';
+  document.getElementById('opTargetFilter').value = '';
+  opOffset = 0;
+  loadOpAudits();
+}
+
+function exportOpAudits(){
+  const q='limit=2000&action='+encodeURIComponent(opActionFilter)+'&target='+encodeURIComponent(opTargetFilter);
+  window.open('/api/op-audits/export?'+q,'_blank');
 }
 
 async function loadAll(){
