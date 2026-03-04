@@ -104,6 +104,15 @@ type ProviderTestReq struct {
 	APIKey     string `json:"apiKey"`
 }
 
+type ProviderTestResult struct {
+	ProviderID int64  `json:"providerId"`
+	Name       string `json:"name"`
+	Target     string `json:"target"`
+	OK         bool   `json:"ok"`
+	StatusCode int    `json:"statusCode"`
+	Detail     string `json:"detail"`
+}
+
 func main() {
 	dataDir := getenv("LX_SWITCH_DATA_DIR", "/var/lib/lx-switch")
 	listen := getenv("LX_SWITCH_LISTEN", ":18777")
@@ -150,6 +159,7 @@ func main() {
 	mux.HandleFunc("/api/providers/import", app.withAuth(app.handleProvidersImport))
 	mux.HandleFunc("/api/providers/export", app.withAuth(app.handleProvidersExport))
 	mux.HandleFunc("/api/providers/test", app.withAuth(app.handleProviderTest))
+	mux.HandleFunc("/api/providers/test-batch", app.withAuth(app.handleProviderTestBatch))
 	mux.HandleFunc("/api/providers/", app.withAuth(app.handleProviderByID))
 	mux.HandleFunc("/api/activate", app.withAuth(app.handleActivate))
 	mux.HandleFunc("/api/backups", app.withAuth(app.handleBackups))
@@ -703,6 +713,40 @@ func (a *App) handleProviderTest(w http.ResponseWriter, r *http.Request) {
 	_ = json.NewEncoder(w).Encode(map[string]any{"ok": ok, "statusCode": code, "detail": detail})
 }
 
+func (a *App) handleProviderTestBatch(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		w.WriteHeader(http.StatusMethodNotAllowed)
+		return
+	}
+	q := ProviderQuery{
+		Search: strings.TrimSpace(r.URL.Query().Get("search")),
+		Target: strings.TrimSpace(r.URL.Query().Get("target")),
+	}
+	list, err := a.listProviders(q)
+	if err != nil {
+		http.Error(w, err.Error(), 500)
+		return
+	}
+	results := make([]ProviderTestResult, 0, len(list))
+	okCount := 0
+	for _, p := range list {
+		code, detail, ok := testProviderConnectivity(p.BaseURL, p.APIKey)
+		if ok {
+			okCount++
+		}
+		results = append(results, ProviderTestResult{
+			ProviderID: p.ID,
+			Name:       p.Name,
+			Target:     p.Target,
+			OK:         ok,
+			StatusCode: code,
+			Detail:     trimForAudit(detail),
+		})
+	}
+	_ = a.insertOpAudit("provider.test.batch", "batch", fmt.Sprintf("total=%d ok=%d fail=%d", len(list), okCount, len(list)-okCount), clientIP(r), strings.TrimSpace(r.UserAgent()))
+	_ = json.NewEncoder(w).Encode(map[string]any{"ok": true, "total": len(list), "okCount": okCount, "failCount": len(list) - okCount, "items": results})
+}
+
 func (a *App) handleProviderByID(w http.ResponseWriter, r *http.Request) {
 	idStr := strings.TrimPrefix(r.URL.Path, "/api/providers/")
 	if idStr == "" {
@@ -993,6 +1037,9 @@ func (a *App) listProviders(q ProviderQuery) ([]Provider, error) {
 		p.CreatedAt, _ = time.Parse(time.RFC3339, c)
 		p.UpdatedAt, _ = time.Parse(time.RFC3339, u)
 		out = append(out, p)
+	}
+	if out == nil {
+		out = []Provider{}
 	}
 	return out, nil
 }
@@ -1293,6 +1340,7 @@ const indexHTML = `<!doctype html>
 
   <div id="firstRun" class="ok hide"></div>
   <div id="weakToken" class="warn hide"></div>
+  <div id="activeProvider" class="ok hide"></div>
 
   <div class="card">
     <div style="display:flex;justify-content:space-between;align-items:center;gap:10px;">
@@ -1341,6 +1389,7 @@ const indexHTML = `<!doctype html>
     <div class="actions">
       <button onclick="applyProviderFilter()">应用过滤</button>
       <button class="ghost" onclick="clearProviderFilter()">清空过滤</button>
+      <button class="ghost" onclick="testProvidersBatch()">批量测试当前筛选</button>
     </div>
     <table><thead><tr><th>ID</th><th>Name</th><th>Target</th><th>Model</th><th>操作</th></tr></thead><tbody id="rows"></tbody></table>
   </div>
@@ -1469,6 +1518,11 @@ async function loadMeta(){
   }else{
     setBox('weakToken','');
   }
+  if(m.activeProvider){
+    setBox('activeProvider','当前生效 Provider ID: '+m.activeProvider);
+  }else{
+    setBox('activeProvider','当前尚未激活 Provider');
+  }
 }
 
 async function loadProviders(){
@@ -1493,6 +1547,8 @@ async function activate(id){
   const r=await api('/api/activate',{method:'POST',body:JSON.stringify({providerId:id})});
   alert('已激活，备份: '+r.backup);
   await loadBackups();
+  await loadMeta();
+  await loadOpAudits();
 }
 
 async function delP(id){
@@ -1539,6 +1595,19 @@ async function testProvider(id){
   }else{
     alert('连通性测试失败，HTTP '+(r.statusCode||0)+'\n'+(r.detail||''));
   }
+  await loadOpAudits();
+}
+
+async function testProvidersBatch(){
+  const q='search='+encodeURIComponent(providerSearch)+'&target='+encodeURIComponent(providerTargetFilter);
+  const r = await api('/api/providers/test-batch?'+q,{method:'POST'});
+  let msg = '批量测试完成：总计 '+(r.total||0)+'，通过 '+(r.okCount||0)+'，失败 '+(r.failCount||0);
+  const fail = (r.items||[]).filter(x=>!x.ok).slice(0,5);
+  if(fail.length){
+    msg += '\n失败样例：\n' + fail.map(x=>('#'+x.providerId+' '+x.name+' ['+x.target+'] code='+x.statusCode)).join('\n');
+  }
+  alert(msg);
+  await loadOpAudits();
 }
 
 async function loadBackups(){
