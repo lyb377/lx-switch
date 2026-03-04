@@ -130,6 +130,20 @@ type ProviderTestResult struct {
 }
 
 func main() {
+	app, listen, err := newAppFromEnv()
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	srv := &http.Server{Addr: listen, Handler: logging(app.newMux())}
+	log.Printf("lx-switch listening on %s, data=%s", listen, app.dataDir)
+	if app.adminToken == "change-me-please" {
+		log.Printf("WARNING: LX_SWITCH_TOKEN is default, please change it in service env")
+	}
+	log.Fatal(srv.ListenAndServe())
+}
+
+func newAppFromEnv() (*App, string, error) {
 	dataDir := getenv("LX_SWITCH_DATA_DIR", "/var/lib/lx-switch")
 	listen := getenv("LX_SWITCH_LISTEN", ":18777")
 	token := os.Getenv("LX_SWITCH_TOKEN")
@@ -138,17 +152,17 @@ func main() {
 	}
 
 	if err := os.MkdirAll(dataDir, 0o755); err != nil {
-		log.Fatal(err)
+		return nil, "", err
 	}
 	backupDir := filepath.Join(dataDir, "backups")
 	if err := os.MkdirAll(backupDir, 0o755); err != nil {
-		log.Fatal(err)
+		return nil, "", err
 	}
 
 	dbPath := filepath.Join(dataDir, "lx-switch.db")
 	db, err := sql.Open("sqlite3", dbPath)
 	if err != nil {
-		log.Fatal(err)
+		return nil, "", err
 	}
 
 	app := &App{
@@ -165,41 +179,38 @@ func main() {
 		auditCleanupEnabled: getenvBool("LX_SWITCH_AUDIT_CLEANUP_ENABLED", true),
 	}
 	if err := app.initDB(); err != nil {
-		log.Fatal(err)
+		return nil, "", err
 	}
 	if app.auditCleanupEnabled {
 		go app.startAuditCleanupLoop()
 	}
+	return app, listen, nil
+}
 
+func (a *App) newMux() *http.ServeMux {
 	mux := http.NewServeMux()
-	mux.HandleFunc("/", app.withPageAuth(app.handleIndex))
-	mux.HandleFunc("/login", app.handleLogin)
-	mux.HandleFunc("/logout", app.withPageAuth(app.handleLogout))
-	mux.HandleFunc("/healthz", app.handleHealth)
-	mux.HandleFunc("/api/providers", app.withAuth(app.handleProviders))
-	mux.HandleFunc("/api/providers/import", app.withAuth(app.handleProvidersImport))
-	mux.HandleFunc("/api/providers/import-cc", app.withAuth(app.handleProvidersImportCCSwitch))
-	mux.HandleFunc("/api/providers/export", app.withAuth(app.handleProvidersExport))
-	mux.HandleFunc("/api/providers/test", app.withAuth(app.handleProviderTest))
-	mux.HandleFunc("/api/providers/test-batch", app.withAuth(app.handleProviderTestBatch))
-	mux.HandleFunc("/api/providers/", app.withAuth(app.handleProviderByID))
-	mux.HandleFunc("/api/activate", app.withAuth(app.handleActivate))
-	mux.HandleFunc("/api/backups", app.withAuth(app.handleBackups))
-	mux.HandleFunc("/api/rollback", app.withAuth(app.handleRollback))
-	mux.HandleFunc("/api/meta", app.withAuth(app.handleMeta))
-	mux.HandleFunc("/api/login-audits", app.withAuth(app.handleLoginAudits))
-	mux.HandleFunc("/api/login-audits/export", app.withAuth(app.handleLoginAuditsExport))
-	mux.HandleFunc("/api/op-audits", app.withAuth(app.handleOpAudits))
-	mux.HandleFunc("/api/op-audits/export", app.withAuth(app.handleOpAuditsExport))
-	mux.HandleFunc("/api/audits/cleanup", app.withAuth(app.handleAuditsCleanup))
-	mux.HandleFunc("/api/audits/settings", app.withAuth(app.handleAuditSettings))
-
-	srv := &http.Server{Addr: listen, Handler: logging(mux)}
-	log.Printf("lx-switch listening on %s, data=%s", listen, dataDir)
-	if token == "change-me-please" {
-		log.Printf("WARNING: LX_SWITCH_TOKEN is default, please change it in service env")
-	}
-	log.Fatal(srv.ListenAndServe())
+	mux.HandleFunc("/", a.withPageAuth(a.handleIndex))
+	mux.HandleFunc("/login", a.handleLogin)
+	mux.HandleFunc("/logout", a.withPageAuth(a.handleLogout))
+	mux.HandleFunc("/healthz", a.handleHealth)
+	mux.HandleFunc("/api/providers", a.withAuth(a.handleProviders))
+	mux.HandleFunc("/api/providers/import", a.withAuth(a.handleProvidersImport))
+	mux.HandleFunc("/api/providers/import-cc", a.withAuth(a.handleProvidersImportCCSwitch))
+	mux.HandleFunc("/api/providers/export", a.withAuth(a.handleProvidersExport))
+	mux.HandleFunc("/api/providers/test", a.withAuth(a.handleProviderTest))
+	mux.HandleFunc("/api/providers/test-batch", a.withAuth(a.handleProviderTestBatch))
+	mux.HandleFunc("/api/providers/", a.withAuth(a.handleProviderByID))
+	mux.HandleFunc("/api/activate", a.withAuth(a.handleActivate))
+	mux.HandleFunc("/api/backups", a.withAuth(a.handleBackups))
+	mux.HandleFunc("/api/rollback", a.withAuth(a.handleRollback))
+	mux.HandleFunc("/api/meta", a.withAuth(a.handleMeta))
+	mux.HandleFunc("/api/login-audits", a.withAuth(a.handleLoginAudits))
+	mux.HandleFunc("/api/login-audits/export", a.withAuth(a.handleLoginAuditsExport))
+	mux.HandleFunc("/api/op-audits", a.withAuth(a.handleOpAudits))
+	mux.HandleFunc("/api/op-audits/export", a.withAuth(a.handleOpAuditsExport))
+	mux.HandleFunc("/api/audits/cleanup", a.withAuth(a.handleAuditsCleanup))
+	mux.HandleFunc("/api/audits/settings", a.withAuth(a.handleAuditSettings))
+	return mux
 }
 
 func (a *App) initDB() error {
