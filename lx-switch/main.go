@@ -23,17 +23,18 @@ import (
 )
 
 type App struct {
-	db                 *sql.DB
-	dataDir            string
-	backupDir          string
-	adminToken         string
-	failed             map[string]*attemptState
-	mu                 sync.Mutex
-	maxAttempts        int
-	window             time.Duration
-	lockout            time.Duration
-	maxLoginBodyBytes  int64
-	auditRetentionDays int
+	db                  *sql.DB
+	dataDir             string
+	backupDir           string
+	adminToken          string
+	failed              map[string]*attemptState
+	mu                  sync.Mutex
+	maxAttempts         int
+	window              time.Duration
+	lockout             time.Duration
+	maxLoginBodyBytes   int64
+	auditRetentionDays  int
+	auditCleanupEnabled bool
 }
 
 type attemptState struct {
@@ -137,19 +138,23 @@ func main() {
 	}
 
 	app := &App{
-		db:                 db,
-		dataDir:            dataDir,
-		backupDir:          backupDir,
-		adminToken:         token,
-		failed:             map[string]*attemptState{},
-		maxAttempts:        getenvInt("LX_SWITCH_MAX_LOGIN_ATTEMPTS", 6),
-		window:             time.Duration(getenvInt("LX_SWITCH_LOGIN_WINDOW_SEC", 300)) * time.Second,
-		lockout:            time.Duration(getenvInt("LX_SWITCH_LOGIN_LOCK_SEC", 900)) * time.Second,
-		maxLoginBodyBytes:  int64(getenvInt("LX_SWITCH_LOGIN_MAX_BODY", 4096)),
-		auditRetentionDays: getenvInt("LX_SWITCH_AUDIT_RETENTION_DAYS", 30),
+		db:                  db,
+		dataDir:             dataDir,
+		backupDir:           backupDir,
+		adminToken:          token,
+		failed:              map[string]*attemptState{},
+		maxAttempts:         getenvInt("LX_SWITCH_MAX_LOGIN_ATTEMPTS", 6),
+		window:              time.Duration(getenvInt("LX_SWITCH_LOGIN_WINDOW_SEC", 300)) * time.Second,
+		lockout:             time.Duration(getenvInt("LX_SWITCH_LOGIN_LOCK_SEC", 900)) * time.Second,
+		maxLoginBodyBytes:   int64(getenvInt("LX_SWITCH_LOGIN_MAX_BODY", 4096)),
+		auditRetentionDays:  getenvInt("LX_SWITCH_AUDIT_RETENTION_DAYS", 30),
+		auditCleanupEnabled: getenvBool("LX_SWITCH_AUDIT_CLEANUP_ENABLED", true),
 	}
 	if err := app.initDB(); err != nil {
 		log.Fatal(err)
+	}
+	if app.auditCleanupEnabled {
+		go app.startAuditCleanupLoop()
 	}
 
 	mux := http.NewServeMux()
@@ -423,11 +428,12 @@ func (a *App) handleMeta(w http.ResponseWriter, r *http.Request) {
 	active, _ := a.getState("active_provider")
 	cnt, _ := a.countProviders()
 	_ = json.NewEncoder(w).Encode(map[string]any{
-		"activeProvider":     active,
-		"providerCount":      cnt,
-		"firstRun":           cnt == 0,
-		"tokenWeak":          a.adminToken == "change-me-please",
-		"auditRetentionDays": a.auditRetentionDays,
+		"activeProvider":      active,
+		"providerCount":       cnt,
+		"firstRun":            cnt == 0,
+		"tokenWeak":           a.adminToken == "change-me-please",
+		"auditRetentionDays":  a.auditRetentionDays,
+		"auditCleanupEnabled": a.auditCleanupEnabled,
 	})
 }
 
@@ -549,22 +555,43 @@ func (a *App) handleAuditsCleanup(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	keepDays := parseIntRange(r.URL.Query().Get("keepDays"), a.auditRetentionDays, 1, 3650)
-	cutoff := time.Now().Add(-time.Duration(keepDays) * 24 * time.Hour).Format(time.RFC3339)
-
-	res1, err := a.db.Exec(`DELETE FROM login_audits WHERE created_at < ?`, cutoff)
+	l1, l2, cutoff, err := a.cleanupAudits(keepDays)
 	if err != nil {
 		http.Error(w, err.Error(), 500)
 		return
+	}
+	_ = a.insertOpAudit("audit.cleanup", "audits", fmt.Sprintf("keepDays=%d loginDeleted=%d opDeleted=%d", keepDays, l1, l2), clientIP(r), strings.TrimSpace(r.UserAgent()))
+	_ = json.NewEncoder(w).Encode(map[string]any{"ok": true, "keepDays": keepDays, "cutoff": cutoff, "loginDeleted": l1, "opDeleted": l2, "totalDeleted": l1 + l2})
+}
+
+func (a *App) cleanupAudits(keepDays int) (loginDeleted int64, opDeleted int64, cutoff string, err error) {
+	cutoff = time.Now().Add(-time.Duration(keepDays) * 24 * time.Hour).Format(time.RFC3339)
+	res1, err := a.db.Exec(`DELETE FROM login_audits WHERE created_at < ?`, cutoff)
+	if err != nil {
+		return 0, 0, cutoff, err
 	}
 	res2, err := a.db.Exec(`DELETE FROM op_audits WHERE created_at < ?`, cutoff)
 	if err != nil {
-		http.Error(w, err.Error(), 500)
-		return
+		return 0, 0, cutoff, err
 	}
 	l1, _ := res1.RowsAffected()
 	l2, _ := res2.RowsAffected()
-	_ = a.insertOpAudit("audit.cleanup", "audits", fmt.Sprintf("keepDays=%d loginDeleted=%d opDeleted=%d", keepDays, l1, l2), clientIP(r), strings.TrimSpace(r.UserAgent()))
-	_ = json.NewEncoder(w).Encode(map[string]any{"ok": true, "keepDays": keepDays, "cutoff": cutoff, "loginDeleted": l1, "opDeleted": l2, "totalDeleted": l1 + l2})
+	return l1, l2, cutoff, nil
+}
+
+func (a *App) startAuditCleanupLoop() {
+	for {
+		if keep := a.auditRetentionDays; keep > 0 {
+			l1, l2, cutoff, err := a.cleanupAudits(keep)
+			if err != nil {
+				log.Printf("audit cleanup failed: %v", err)
+			} else if l1+l2 > 0 {
+				_ = a.insertOpAudit("audit.cleanup.auto", "audits", fmt.Sprintf("keepDays=%d cutoff=%s loginDeleted=%d opDeleted=%d", keep, cutoff, l1, l2), "127.0.0.1", "auto-cleanup")
+				log.Printf("audit cleanup auto: keep=%d deleted login=%d op=%d", keep, l1, l2)
+			}
+		}
+		time.Sleep(24 * time.Hour)
+	}
 }
 
 func (a *App) handleProviders(w http.ResponseWriter, r *http.Request) {
@@ -1281,6 +1308,21 @@ func getenvInt(k string, d int) int {
 	return n
 }
 
+func getenvBool(k string, d bool) bool {
+	v := strings.TrimSpace(strings.ToLower(os.Getenv(k)))
+	if v == "" {
+		return d
+	}
+	switch v {
+	case "1", "true", "yes", "on":
+		return true
+	case "0", "false", "no", "off":
+		return false
+	default:
+		return d
+	}
+}
+
 func parseIntRange(raw string, d, min, max int) int {
 	v := strings.TrimSpace(raw)
 	if v == "" {
@@ -1602,8 +1644,9 @@ async function loadMeta(){
     setBox('activeProvider','当前尚未激活 Provider');
   }
   const ard = Number(m.auditRetentionDays||0);
+  const ace = !!m.auditCleanupEnabled;
   const ar = document.getElementById('auditRetention');
-  if(ar){ ar.textContent = ard>0 ? ('审计默认保留天数：'+ard+' 天') : ''; }
+  if(ar){ ar.textContent = ard>0 ? ('审计默认保留天数：'+ard+' 天；自动清理：'+(ace?'开启':'关闭')) : ''; }
 }
 
 async function loadProviders(){
