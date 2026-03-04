@@ -59,3 +59,5 @@ go run .
 - `docs/UI_HANDOFF.md`
 - `docs/ROADMAP.md`
 - `docs/PROGRESS.md`
+- `docs/API.md`
+- `CONTRIBUTING.md`
