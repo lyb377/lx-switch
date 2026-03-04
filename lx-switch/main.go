@@ -1421,6 +1421,8 @@ const indexHTML = `<!doctype html>
       <button onclick="applyProviderFilter()">应用过滤</button>
       <button class="ghost" onclick="clearProviderFilter()">清空过滤</button>
       <button class="ghost" onclick="testProvidersBatch()">批量测试当前筛选</button>
+      <button class="ghost" onclick="exportLastBatchTestCsv()">导出最近批测(CSV)</button>
+      <button class="ghost" onclick="exportLastBatchTestJson()">导出最近批测(JSON)</button>
     </div>
     <table><thead><tr><th>ID</th><th>Name</th><th>Target</th><th>Model</th><th>操作</th></tr></thead><tbody id="rows"></tbody></table>
   </div>
@@ -1443,6 +1445,8 @@ const indexHTML = `<!doctype html>
       <button onclick="previewImportProviders()">预检（dry-run）</button>
       <button onclick="importProviders()">导入</button>
       <button class="ghost" onclick="exportProviders()">导出当前筛选 JSON</button>
+      <button class="ghost" onclick="exportLastImportJson()">导出最近导入结果(JSON)</button>
+      <button class="ghost" onclick="exportLastImportCsv()">导出最近导入结果(CSV)</button>
     </div>
   </div>
 
@@ -1495,6 +1499,8 @@ let editId = null;
 let providerMap = {};
 let providerSearch = '';
 let providerTargetFilter = '';
+let lastImportResult = null;
+let lastBatchTestResult = null;
 let auditOffset = 0;
 const auditLimit = 20;
 let auditTotal = 0;
@@ -1623,6 +1629,7 @@ async function importProviders(){
   obj.previewLimit = Number(document.getElementById('previewLimit').value || 30);
   obj.dryRun = false;
   const r = await api('/api/providers/import',{method:'POST',body:JSON.stringify(obj)});
+  lastImportResult = r;
   alert('导入完成: 新增 '+(r.imported||0)+'，覆盖 '+(r.overwritten||0)+'，跳过 '+(r.skipped||0)+'，模式 '+(r.mode||''));
   await loadProviders();
   await loadOpAudits();
@@ -1637,6 +1644,7 @@ async function previewImportProviders(){
   obj.previewLimit = Number(document.getElementById('previewLimit').value || 30);
   obj.dryRun = true;
   const r = await api('/api/providers/import',{method:'POST',body:JSON.stringify(obj)});
+  lastImportResult = r;
   const details = (r.details||[]).slice(0,10).map(x=>('['+x.action+'] '+x.target+'/'+x.name+(x.existingId?(' -> #'+x.existingId):''))).join('\n');
   alert('预检完成（不落库）\n新增 '+(r.imported||0)+'，覆盖 '+(r.overwritten||0)+'，跳过 '+(r.skipped||0)+'，模式 '+(r.mode||'') + (details?('\n\n样例:\n'+details):''));
   await loadOpAudits();
@@ -1645,6 +1653,46 @@ async function previewImportProviders(){
 function exportProviders(){
   const q='search='+encodeURIComponent(providerSearch)+'&target='+encodeURIComponent(providerTargetFilter);
   window.open('/api/providers/export?'+q,'_blank');
+}
+
+function downloadTextFile(name, text, type='text/plain;charset=utf-8'){
+  const blob = new Blob([text], {type});
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = name;
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  URL.revokeObjectURL(url);
+}
+
+function exportLastImportJson(){
+  if(!lastImportResult){ alert('暂无导入结果，请先执行预检或导入'); return; }
+  downloadTextFile('import-result-'+Date.now()+'.json', JSON.stringify(lastImportResult, null, 2), 'application/json;charset=utf-8');
+}
+
+function csvEscJs(s){
+  s = String(s ?? '');
+  return '"'+s.replace(/"/g,'""')+'"';
+}
+
+function exportLastImportCsv(){
+  if(!lastImportResult){ alert('暂无导入结果，请先执行预检或导入'); return; }
+  const rows = [];
+  rows.push('index,action,target,name,existing_id');
+  (lastImportResult.details||[]).forEach(d=>{
+    rows.push([d.index, csvEscJs(d.action), csvEscJs(d.target), csvEscJs(d.name), d.existingId||''].join(','));
+  });
+  rows.push('');
+  rows.push('summary_key,summary_value');
+  rows.push('mode,'+csvEscJs(lastImportResult.mode||''));
+  rows.push('dryRun,'+csvEscJs(lastImportResult.dryRun===true));
+  rows.push('imported,'+(lastImportResult.imported||0));
+  rows.push('overwritten,'+(lastImportResult.overwritten||0));
+  rows.push('skipped,'+(lastImportResult.skipped||0));
+  rows.push('detailCount,'+(lastImportResult.detailCount||0));
+  downloadTextFile('import-result-'+Date.now()+'.csv', rows.join('\n'), 'text/csv;charset=utf-8');
 }
 
 async function testProvider(id){
@@ -1660,6 +1708,7 @@ async function testProvider(id){
 async function testProvidersBatch(){
   const q='search='+encodeURIComponent(providerSearch)+'&target='+encodeURIComponent(providerTargetFilter);
   const r = await api('/api/providers/test-batch?'+q,{method:'POST'});
+  lastBatchTestResult = r;
   let msg = '批量测试完成：总计 '+(r.total||0)+'，通过 '+(r.okCount||0)+'，失败 '+(r.failCount||0);
   const fail = (r.items||[]).filter(x=>!x.ok).slice(0,5);
   if(fail.length){
@@ -1667,6 +1716,26 @@ async function testProvidersBatch(){
   }
   alert(msg);
   await loadOpAudits();
+}
+
+function exportLastBatchTestJson(){
+  if(!lastBatchTestResult){ alert('暂无批量测试结果，请先执行批量测试'); return; }
+  downloadTextFile('provider-batch-test-'+Date.now()+'.json', JSON.stringify(lastBatchTestResult, null, 2), 'application/json;charset=utf-8');
+}
+
+function exportLastBatchTestCsv(){
+  if(!lastBatchTestResult){ alert('暂无批量测试结果，请先执行批量测试'); return; }
+  const rows = [];
+  rows.push('provider_id,name,target,ok,status_code,detail');
+  (lastBatchTestResult.items||[]).forEach(it=>{
+    rows.push([it.providerId, csvEscJs(it.name), csvEscJs(it.target), it.ok ? 1 : 0, it.statusCode||0, csvEscJs(it.detail||'')].join(','));
+  });
+  rows.push('');
+  rows.push('summary_key,summary_value');
+  rows.push('total,'+(lastBatchTestResult.total||0));
+  rows.push('okCount,'+(lastBatchTestResult.okCount||0));
+  rows.push('failCount,'+(lastBatchTestResult.failCount||0));
+  downloadTextFile('provider-batch-test-'+Date.now()+'.csv', rows.join('\n'), 'text/csv;charset=utf-8');
 }
 
 async function loadBackups(){
