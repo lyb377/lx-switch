@@ -1,0 +1,13 @@
+# Build outputs
+/lx-switch
+/lx-switch.bak.*
+
+# Runtime data
+/data/
+*.db
+*.sqlite
+
+# OS/editor
+.DS_Store
+.vscode/
+.idea/
