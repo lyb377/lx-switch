@@ -75,6 +75,8 @@ type OpAuditQuery struct {
 	Offset int
 	Action string
 	Target string
+	From   string
+	To     string
 }
 
 type ProviderQuery struct {
@@ -518,6 +520,8 @@ func (a *App) handleOpAudits(w http.ResponseWriter, r *http.Request) {
 		"offset": q.Offset,
 		"action": q.Action,
 		"target": q.Target,
+		"from":   q.From,
+		"to":     q.To,
 	})
 }
 
@@ -1100,6 +1104,14 @@ func (a *App) countOpAudits(q OpAuditQuery) (int, error) {
 		query += ` AND target=?`
 		args = append(args, q.Target)
 	}
+	if q.From != "" {
+		query += ` AND created_at >= ?`
+		args = append(args, q.From)
+	}
+	if q.To != "" {
+		query += ` AND created_at <= ?`
+		args = append(args, q.To)
+	}
 	err := a.db.QueryRow(query, args...).Scan(&n)
 	return n, err
 }
@@ -1114,6 +1126,14 @@ func (a *App) listOpAudits(q OpAuditQuery) ([]OpAudit, error) {
 	if q.Target != "" {
 		query += ` AND target=?`
 		args = append(args, q.Target)
+	}
+	if q.From != "" {
+		query += ` AND created_at >= ?`
+		args = append(args, q.From)
+	}
+	if q.To != "" {
+		query += ` AND created_at <= ?`
+		args = append(args, q.To)
 	}
 	query += ` ORDER BY id DESC LIMIT ? OFFSET ?`
 	args = append(args, q.Limit, q.Offset)
@@ -1384,6 +1404,24 @@ func parseIntRange(raw string, d, min, max int) int {
 	return n
 }
 
+func parseDatePrefixRFC3339(raw string, end bool) string {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return ""
+	}
+	if len(raw) == 10 {
+		if end {
+			raw += "T23:59:59+08:00"
+		} else {
+			raw += "T00:00:00+08:00"
+		}
+	}
+	if t, err := time.Parse(time.RFC3339, raw); err == nil {
+		return t.Format(time.RFC3339)
+	}
+	return ""
+}
+
 func validateSaveReq(req *SaveReq) error {
 	req.Name = strings.TrimSpace(req.Name)
 	req.Target = strings.TrimSpace(req.Target)
@@ -1430,6 +1468,8 @@ func parseOpAuditQuery(r *http.Request) OpAuditQuery {
 		Offset: parseIntRange(r.URL.Query().Get("offset"), 0, 0, 1_000_000),
 		Action: strings.TrimSpace(r.URL.Query().Get("action")),
 		Target: strings.TrimSpace(r.URL.Query().Get("target")),
+		From:   parseDatePrefixRFC3339(strings.TrimSpace(r.URL.Query().Get("from")), false),
+		To:     parseDatePrefixRFC3339(strings.TrimSpace(r.URL.Query().Get("to")), true),
 	}
 	if len(q.Action) > 64 {
 		q.Action = q.Action[:64]
@@ -1611,6 +1651,16 @@ const indexHTML = `<!doctype html>
         <input id="opTargetFilter" placeholder="例如 openclaw"/>
       </div>
     </div>
+    <div class="row">
+      <div>
+        <label>开始日期（from）</label>
+        <input id="opFromFilter" type="date"/>
+      </div>
+      <div>
+        <label>结束日期（to）</label>
+        <input id="opToFilter" type="date"/>
+      </div>
+    </div>
     <div class="actions">
       <button onclick="applyOpFilter()">应用过滤</button>
       <button class="ghost" onclick="clearOpFilter()">清空过滤</button>
@@ -1634,6 +1684,8 @@ const opLimit = 20;
 let opTotal = 0;
 let opActionFilter = '';
 let opTargetFilter = '';
+let opFromFilter = '';
+let opToFilter = '';
 
 function H(){ return {'Content-Type':'application/json'}; }
 async function api(url,opt={}){ const r=await fetch(url,{...opt,credentials:'same-origin',headers:{...(opt.headers||{}),...H()}}); if(!r.ok) throw new Error(await r.text()); return r.json(); }
@@ -1920,7 +1972,7 @@ function exportAudits(){
 }
 
 async function loadOpAudits(){
-  const q='limit='+opLimit+'&offset='+opOffset+'&action='+encodeURIComponent(opActionFilter)+'&target='+encodeURIComponent(opTargetFilter);
+  const q='limit='+opLimit+'&offset='+opOffset+'&action='+encodeURIComponent(opActionFilter)+'&target='+encodeURIComponent(opTargetFilter)+'&from='+encodeURIComponent(opFromFilter)+'&to='+encodeURIComponent(opToFilter);
   const res=await api('/api/op-audits?'+q);
   const list=res.items||[];
   opTotal = res.total||0;
@@ -1931,6 +1983,8 @@ async function loadOpAudits(){
   const f = [];
   if(opActionFilter) f.push('action='+opActionFilter);
   if(opTargetFilter) f.push('target='+opTargetFilter);
+  if(opFromFilter) f.push('from='+opFromFilter);
+  if(opToFilter) f.push('to='+opToFilter);
   pager.textContent='操作日志：共 '+opTotal+' 条，当前 '+from+' - '+to + (f.length?('，过滤：'+f.join(', ')):'');
   list.forEach(a=>{
     const tr=document.createElement('tr');
@@ -1954,6 +2008,8 @@ function nextOpPage(){
 function applyOpFilter(){
   opActionFilter = (document.getElementById('opActionFilter').value || '').trim();
   opTargetFilter = (document.getElementById('opTargetFilter').value || '').trim();
+  opFromFilter = (document.getElementById('opFromFilter').value || '').trim();
+  opToFilter = (document.getElementById('opToFilter').value || '').trim();
   opOffset = 0;
   loadOpAudits();
 }
@@ -1961,14 +2017,18 @@ function applyOpFilter(){
 function clearOpFilter(){
   opActionFilter = '';
   opTargetFilter = '';
+  opFromFilter = '';
+  opToFilter = '';
   document.getElementById('opActionFilter').value = '';
   document.getElementById('opTargetFilter').value = '';
+  document.getElementById('opFromFilter').value = '';
+  document.getElementById('opToFilter').value = '';
   opOffset = 0;
   loadOpAudits();
 }
 
 function exportOpAudits(){
-  const q='limit=2000&action='+encodeURIComponent(opActionFilter)+'&target='+encodeURIComponent(opTargetFilter);
+  const q='limit=2000&action='+encodeURIComponent(opActionFilter)+'&target='+encodeURIComponent(opTargetFilter)+'&from='+encodeURIComponent(opFromFilter)+'&to='+encodeURIComponent(opToFilter);
   window.open('/api/op-audits/export?'+q,'_blank');
 }
 
