@@ -29,6 +29,7 @@ type App struct {
 	adminToken          string
 	failed              map[string]*attemptState
 	mu                  sync.Mutex
+	settingsMu          sync.RWMutex
 	maxAttempts         int
 	window              time.Duration
 	lockout             time.Duration
@@ -177,6 +178,7 @@ func main() {
 	mux.HandleFunc("/api/op-audits", app.withAuth(app.handleOpAudits))
 	mux.HandleFunc("/api/op-audits/export", app.withAuth(app.handleOpAuditsExport))
 	mux.HandleFunc("/api/audits/cleanup", app.withAuth(app.handleAuditsCleanup))
+	mux.HandleFunc("/api/audits/settings", app.withAuth(app.handleAuditSettings))
 
 	srv := &http.Server{Addr: listen, Handler: logging(mux)}
 	log.Printf("lx-switch listening on %s, data=%s", listen, dataDir)
@@ -554,7 +556,10 @@ func (a *App) handleAuditsCleanup(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusMethodNotAllowed)
 		return
 	}
-	keepDays := parseIntRange(r.URL.Query().Get("keepDays"), a.auditRetentionDays, 1, 3650)
+	a.settingsMu.RLock()
+	keepDefault := a.auditRetentionDays
+	a.settingsMu.RUnlock()
+	keepDays := parseIntRange(r.URL.Query().Get("keepDays"), keepDefault, 1, 3650)
 	l1, l2, cutoff, err := a.cleanupAudits(keepDays)
 	if err != nil {
 		http.Error(w, err.Error(), 500)
@@ -581,7 +586,11 @@ func (a *App) cleanupAudits(keepDays int) (loginDeleted int64, opDeleted int64, 
 
 func (a *App) startAuditCleanupLoop() {
 	for {
-		if keep := a.auditRetentionDays; keep > 0 {
+		a.settingsMu.RLock()
+		enabled := a.auditCleanupEnabled
+		keep := a.auditRetentionDays
+		a.settingsMu.RUnlock()
+		if enabled && keep > 0 {
 			l1, l2, cutoff, err := a.cleanupAudits(keep)
 			if err != nil {
 				log.Printf("audit cleanup failed: %v", err)
@@ -591,6 +600,40 @@ func (a *App) startAuditCleanupLoop() {
 			}
 		}
 		time.Sleep(24 * time.Hour)
+	}
+}
+
+func (a *App) handleAuditSettings(w http.ResponseWriter, r *http.Request) {
+	switch r.Method {
+	case http.MethodGet:
+		a.settingsMu.RLock()
+		keep := a.auditRetentionDays
+		enabled := a.auditCleanupEnabled
+		a.settingsMu.RUnlock()
+		_ = json.NewEncoder(w).Encode(map[string]any{"ok": true, "auditRetentionDays": keep, "auditCleanupEnabled": enabled})
+	case http.MethodPost:
+		var req struct {
+			AuditRetentionDays  int   `json:"auditRetentionDays"`
+			AuditCleanupEnabled *bool `json:"auditCleanupEnabled"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			http.Error(w, err.Error(), 400)
+			return
+		}
+		a.settingsMu.Lock()
+		if req.AuditRetentionDays > 0 {
+			a.auditRetentionDays = req.AuditRetentionDays
+		}
+		if req.AuditCleanupEnabled != nil {
+			a.auditCleanupEnabled = *req.AuditCleanupEnabled
+		}
+		keep := a.auditRetentionDays
+		enabled := a.auditCleanupEnabled
+		a.settingsMu.Unlock()
+		_ = a.insertOpAudit("audit.settings.update", "audits", fmt.Sprintf("keepDays=%d enabled=%v", keep, enabled), clientIP(r), strings.TrimSpace(r.UserAgent()))
+		_ = json.NewEncoder(w).Encode(map[string]any{"ok": true, "auditRetentionDays": keep, "auditCleanupEnabled": enabled})
+	default:
+		w.WriteHeader(http.StatusMethodNotAllowed)
 	}
 }
 
@@ -1541,7 +1584,17 @@ const indexHTML = `<!doctype html>
 
   <div class="card">
     <h3>操作审计</h3>
+    <div class="row">
+      <div>
+        <label>默认保留天数</label>
+        <input id="auditKeepDays" type="number" min="1" max="3650" value="30"/>
+      </div>
+      <div>
+        <label><input id="auditAutoEnabled" type="checkbox" checked style="width:auto;margin-right:8px"/>启用自动每日清理</label>
+      </div>
+    </div>
     <div class="actions">
+      <button onclick="saveAuditSettings()">保存审计设置</button>
       <button onclick="prevOpPage()">上一页</button>
       <button onclick="nextOpPage()">下一页</button>
       <button class="ghost" onclick="loadOpAudits()">刷新操作日志</button>
@@ -1647,6 +1700,10 @@ async function loadMeta(){
   const ace = !!m.auditCleanupEnabled;
   const ar = document.getElementById('auditRetention');
   if(ar){ ar.textContent = ard>0 ? ('审计默认保留天数：'+ard+' 天；自动清理：'+(ace?'开启':'关闭')) : ''; }
+  const keepEl = document.getElementById('auditKeepDays');
+  if(keepEl && ard>0) keepEl.value = String(ard);
+  const autoEl = document.getElementById('auditAutoEnabled');
+  if(autoEl) autoEl.checked = ace;
 }
 
 async function loadProviders(){
@@ -1913,6 +1970,16 @@ function clearOpFilter(){
 function exportOpAudits(){
   const q='limit=2000&action='+encodeURIComponent(opActionFilter)+'&target='+encodeURIComponent(opTargetFilter);
   window.open('/api/op-audits/export?'+q,'_blank');
+}
+
+async function saveAuditSettings(){
+  const keep = Number((document.getElementById('auditKeepDays').value || '30').trim());
+  const enabled = !!document.getElementById('auditAutoEnabled').checked;
+  if(!Number.isFinite(keep) || keep < 1){ alert('保留天数需 >= 1'); return; }
+  const r = await api('/api/audits/settings',{method:'POST',body:JSON.stringify({auditRetentionDays:Math.floor(keep),auditCleanupEnabled:enabled})});
+  alert('审计设置已保存：保留 '+(r.auditRetentionDays||0)+' 天，自动清理 '+(r.auditCleanupEnabled?'开启':'关闭'));
+  await loadMeta();
+  await loadOpAudits();
 }
 
 async function cleanupAudits(){
