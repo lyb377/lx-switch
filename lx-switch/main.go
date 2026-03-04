@@ -98,6 +98,12 @@ type SaveReq struct {
 	Notes   string `json:"notes"`
 }
 
+type ProviderTestReq struct {
+	ProviderID int64  `json:"providerId"`
+	BaseURL    string `json:"baseUrl"`
+	APIKey     string `json:"apiKey"`
+}
+
 func main() {
 	dataDir := getenv("LX_SWITCH_DATA_DIR", "/var/lib/lx-switch")
 	listen := getenv("LX_SWITCH_LISTEN", ":18777")
@@ -142,6 +148,8 @@ func main() {
 	mux.HandleFunc("/healthz", app.handleHealth)
 	mux.HandleFunc("/api/providers", app.withAuth(app.handleProviders))
 	mux.HandleFunc("/api/providers/import", app.withAuth(app.handleProvidersImport))
+	mux.HandleFunc("/api/providers/export", app.withAuth(app.handleProvidersExport))
+	mux.HandleFunc("/api/providers/test", app.withAuth(app.handleProviderTest))
 	mux.HandleFunc("/api/providers/", app.withAuth(app.handleProviderByID))
 	mux.HandleFunc("/api/activate", app.withAuth(app.handleActivate))
 	mux.HandleFunc("/api/backups", app.withAuth(app.handleBackups))
@@ -567,6 +575,7 @@ func (a *App) handleProvidersImport(w http.ResponseWriter, r *http.Request) {
 	r.Body = http.MaxBytesReader(w, r.Body, 1<<20)
 	var req struct {
 		Items []SaveReq `json:"items"`
+		Mode  string    `json:"mode"` // skip|overwrite
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		http.Error(w, err.Error(), 400)
@@ -580,6 +589,14 @@ func (a *App) handleProvidersImport(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "too many items (max 200)", 400)
 		return
 	}
+	mode := strings.ToLower(strings.TrimSpace(req.Mode))
+	if mode == "" {
+		mode = "skip"
+	}
+	if mode != "skip" && mode != "overwrite" {
+		http.Error(w, "mode must be skip or overwrite", 400)
+		return
+	}
 
 	tx, err := a.db.Begin()
 	if err != nil {
@@ -590,11 +607,31 @@ func (a *App) handleProvidersImport(w http.ResponseWriter, r *http.Request) {
 
 	now := time.Now().Format(time.RFC3339)
 	imported := 0
+	overwritten := 0
+	skipped := 0
 	for i := range req.Items {
 		it := req.Items[i]
 		if err := validateSaveReq(&it); err != nil {
 			http.Error(w, fmt.Sprintf("item[%d]: %v", i, err), 400)
 			return
+		}
+		existingID, exists, err := findProviderIDByNameTargetTx(tx, it.Name, it.Target)
+		if err != nil {
+			http.Error(w, err.Error(), 500)
+			return
+		}
+		if exists {
+			if mode == "skip" {
+				skipped++
+				continue
+			}
+			if _, err := tx.Exec(`UPDATE providers SET base_url=?,api_key=?,model=?,notes=?,updated_at=? WHERE id=?`,
+				it.BaseURL, it.APIKey, it.Model, it.Notes, now, existingID); err != nil {
+				http.Error(w, err.Error(), 500)
+				return
+			}
+			overwritten++
+			continue
 		}
 		if _, err := tx.Exec(`INSERT INTO providers(name,target,base_url,api_key,model,notes,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?)`,
 			it.Name, it.Target, it.BaseURL, it.APIKey, it.Model, it.Notes, now, now); err != nil {
@@ -607,8 +644,63 @@ func (a *App) handleProvidersImport(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), 500)
 		return
 	}
-	_ = a.insertOpAudit("provider.import", "batch", fmt.Sprintf("count=%d", imported), clientIP(r), strings.TrimSpace(r.UserAgent()))
-	_ = json.NewEncoder(w).Encode(map[string]any{"ok": true, "imported": imported})
+	_ = a.insertOpAudit("provider.import", "batch", fmt.Sprintf("mode=%s imported=%d overwritten=%d skipped=%d", mode, imported, overwritten, skipped), clientIP(r), strings.TrimSpace(r.UserAgent()))
+	_ = json.NewEncoder(w).Encode(map[string]any{"ok": true, "mode": mode, "imported": imported, "overwritten": overwritten, "skipped": skipped})
+}
+
+func (a *App) handleProvidersExport(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		w.WriteHeader(http.StatusMethodNotAllowed)
+		return
+	}
+	q := ProviderQuery{
+		Search: strings.TrimSpace(r.URL.Query().Get("search")),
+		Target: strings.TrimSpace(r.URL.Query().Get("target")),
+	}
+	list, err := a.listProviders(q)
+	if err != nil {
+		http.Error(w, err.Error(), 500)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+	w.Header().Set("Content-Disposition", fmt.Sprintf("attachment; filename=providers-%s.json", time.Now().Format("20060102-150405")))
+	_ = json.NewEncoder(w).Encode(map[string]any{"items": list, "count": len(list)})
+}
+
+func (a *App) handleProviderTest(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		w.WriteHeader(http.StatusMethodNotAllowed)
+		return
+	}
+	var req ProviderTestReq
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, err.Error(), 400)
+		return
+	}
+	baseURL := strings.TrimSpace(req.BaseURL)
+	apiKey := strings.TrimSpace(req.APIKey)
+	if req.ProviderID > 0 {
+		p, err := a.getProvider(req.ProviderID)
+		if err != nil {
+			http.Error(w, "provider not found", 404)
+			return
+		}
+		if baseURL == "" {
+			baseURL = p.BaseURL
+		}
+		if apiKey == "" {
+			apiKey = p.APIKey
+		}
+	}
+	if baseURL == "" {
+		http.Error(w, "baseUrl required", 400)
+		return
+	}
+	code, detail, ok := testProviderConnectivity(baseURL, apiKey)
+	if req.ProviderID > 0 {
+		_ = a.insertOpAudit("provider.test", "id", fmt.Sprintf("providerId=%d ok=%v code=%d", req.ProviderID, ok, code), clientIP(r), strings.TrimSpace(r.UserAgent()))
+	}
+	_ = json.NewEncoder(w).Encode(map[string]any{"ok": ok, "statusCode": code, "detail": detail})
 }
 
 func (a *App) handleProviderByID(w http.ResponseWriter, r *http.Request) {
@@ -675,6 +767,12 @@ func (a *App) handleActivate(w http.ResponseWriter, r *http.Request) {
 	p, err := a.getProvider(req.ProviderID)
 	if err != nil {
 		http.Error(w, err.Error(), 404)
+		return
+	}
+	code, detail, ok := testProviderConnectivity(p.BaseURL, p.APIKey)
+	if !ok {
+		_ = a.insertOpAudit("provider.activate.blocked", p.Target, fmt.Sprintf("id=%d name=%s code=%d detail=%s", p.ID, p.Name, code, trimForAudit(detail)), clientIP(r), strings.TrimSpace(r.UserAgent()))
+		http.Error(w, fmt.Sprintf("connectivity test failed: code=%d detail=%s", code, detail), 400)
 		return
 	}
 
@@ -899,6 +997,54 @@ func (a *App) listProviders(q ProviderQuery) ([]Provider, error) {
 	return out, nil
 }
 
+func findProviderIDByNameTargetTx(tx *sql.Tx, name, target string) (int64, bool, error) {
+	var id int64
+	err := tx.QueryRow(`SELECT id FROM providers WHERE name=? AND target=? LIMIT 1`, name, target).Scan(&id)
+	if err == sql.ErrNoRows {
+		return 0, false, nil
+	}
+	if err != nil {
+		return 0, false, err
+	}
+	return id, true, nil
+}
+
+func testProviderConnectivity(baseURL, apiKey string) (int, string, bool) {
+	baseURL = strings.TrimSpace(baseURL)
+	if baseURL == "" {
+		return 0, "empty baseUrl", false
+	}
+	u, err := url.Parse(baseURL)
+	if err != nil || u.Scheme == "" || u.Host == "" {
+		return 0, "invalid baseUrl", false
+	}
+	candidate := strings.TrimRight(baseURL, "/")
+	if !strings.Contains(candidate, "/v1") {
+		candidate = candidate + "/v1"
+	}
+	endpoint := strings.TrimRight(candidate, "/") + "/models"
+
+	client := &http.Client{Timeout: 8 * time.Second}
+	req, _ := http.NewRequest(http.MethodGet, endpoint, nil)
+	if strings.TrimSpace(apiKey) != "" {
+		req.Header.Set("Authorization", "Bearer "+apiKey)
+	}
+	resp, err := client.Do(req)
+	if err != nil {
+		return 0, err.Error(), false
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode >= 200 && resp.StatusCode < 300 {
+		return resp.StatusCode, "ok", true
+	}
+	b, _ := io.ReadAll(io.LimitReader(resp.Body, 300))
+	detail := strings.TrimSpace(string(b))
+	if detail == "" {
+		detail = resp.Status
+	}
+	return resp.StatusCode, detail, false
+}
+
 func (a *App) getProvider(id int64) (*Provider, error) {
 	var p Provider
 	var c, u string
@@ -1079,6 +1225,14 @@ func csvEsc(s string) string {
 	return `"` + s + `"`
 }
 
+func trimForAudit(s string) string {
+	s = strings.TrimSpace(s)
+	if len(s) > 160 {
+		return s[:160] + "..."
+	}
+	return s
+}
+
 func parseOpAuditQuery(r *http.Request) OpAuditQuery {
 	q := OpAuditQuery{
 		Limit:  parseIntRange(r.URL.Query().Get("limit"), 50, 1, 200),
@@ -1193,10 +1347,11 @@ const indexHTML = `<!doctype html>
 
   <div class="card">
     <h3>批量导入 Providers(JSON)</h3>
-    <p class="muted">格式：{"items":[{"name":"...","target":"openclaw","baseUrl":"https://...","apiKey":"...","model":"...","notes":"..."}]}</p>
-    <textarea id="importJson" rows="6" placeholder='{"items":[{"name":"demo","target":"openclaw","baseUrl":"https://cli.lyb123.top/v1","model":"gpt-5.3-codex"}]}'></textarea>
+    <p class="muted">格式：{"items":[{"name":"...","target":"openclaw","baseUrl":"https://...","apiKey":"...","model":"...","notes":"..."}],"mode":"skip|overwrite"}</p>
+    <textarea id="importJson" rows="6" placeholder='{"items":[{"name":"demo","target":"openclaw","baseUrl":"https://cli.lyb123.top/v1","model":"gpt-5.3-codex"}],"mode":"skip"}'></textarea>
     <div class="actions">
       <button onclick="importProviders()">导入</button>
+      <button class="ghost" onclick="exportProviders()">导出当前筛选 JSON</button>
     </div>
   </div>
 
@@ -1326,6 +1481,7 @@ async function loadProviders(){
     const tr=document.createElement('tr');
     tr.innerHTML='<td>'+p.id+'</td><td>'+p.name+'</td><td>'+p.target+'</td><td>'+(p.model||'')+'</td><td class="actions">'
       + '<button onclick="activate('+p.id+')">激活</button>'
+      + '<button class="ghost" onclick="testProvider('+p.id+')">测试</button>'
       + '<button class="ghost" onclick="startEdit('+p.id+')">编辑</button>'
       + '<button onclick="delP('+p.id+')">删除</button>'
       + '</td>';
@@ -1366,9 +1522,23 @@ async function importProviders(){
   let obj;
   try{ obj = JSON.parse(raw); }catch(e){ alert('JSON 格式错误: '+e.message); return; }
   const r = await api('/api/providers/import',{method:'POST',body:JSON.stringify(obj)});
-  alert('导入完成: '+(r.imported||0));
+  alert('导入完成: 新增 '+(r.imported||0)+'，覆盖 '+(r.overwritten||0)+'，跳过 '+(r.skipped||0)+'，模式 '+(r.mode||''));
   await loadProviders();
   await loadOpAudits();
+}
+
+function exportProviders(){
+  const q='search='+encodeURIComponent(providerSearch)+'&target='+encodeURIComponent(providerTargetFilter);
+  window.open('/api/providers/export?'+q,'_blank');
+}
+
+async function testProvider(id){
+  const r = await api('/api/providers/test',{method:'POST',body:JSON.stringify({providerId:id})});
+  if(r.ok){
+    alert('连通性测试通过，HTTP '+(r.statusCode||0));
+  }else{
+    alert('连通性测试失败，HTTP '+(r.statusCode||0)+'\n'+(r.detail||''));
+  }
 }
 
 async function loadBackups(){
