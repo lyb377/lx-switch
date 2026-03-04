@@ -8,7 +8,6 @@ import (
 	"html"
 	"io"
 	"log"
-	"net"
 	"net/http"
 	"net/url"
 	"os"
@@ -252,37 +251,6 @@ CREATE TABLE IF NOT EXISTS op_audits (
 	return err
 }
 
-func (a *App) withAuth(next http.HandlerFunc) http.HandlerFunc {
-	return func(w http.ResponseWriter, r *http.Request) {
-		t := r.Header.Get("X-Admin-Token")
-		if t == "" {
-			t = r.URL.Query().Get("token")
-		}
-		if t == "" {
-			if c, err := r.Cookie("lx_token"); err == nil {
-				t = c.Value
-			}
-		}
-		if t != a.adminToken {
-			w.WriteHeader(http.StatusUnauthorized)
-			_ = json.NewEncoder(w).Encode(map[string]string{"error": "unauthorized"})
-			return
-		}
-		next(w, r)
-	}
-}
-
-func (a *App) withPageAuth(next http.HandlerFunc) http.HandlerFunc {
-	return func(w http.ResponseWriter, r *http.Request) {
-		c, err := r.Cookie("lx_token")
-		if err != nil || c.Value != a.adminToken {
-			http.Redirect(w, r, "/login", http.StatusFound)
-			return
-		}
-		next(w, r)
-	}
-}
-
 func (a *App) handleIndex(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	_, _ = io.WriteString(w, indexHTML)
@@ -365,35 +333,6 @@ func (a *App) handleLogout(w http.ResponseWriter, r *http.Request) {
 		MaxAge:   -1,
 	})
 	http.Redirect(w, r, "/login", http.StatusFound)
-}
-
-func (a *App) requestSecure(r *http.Request) bool {
-	if r.TLS != nil {
-		return true
-	}
-	if strings.EqualFold(r.Header.Get("X-Forwarded-Proto"), "https") {
-		return true
-	}
-	if strings.EqualFold(r.Header.Get("X-Forwarded-Ssl"), "on") {
-		return true
-	}
-	return false
-}
-
-func clientIP(r *http.Request) string {
-	xff := strings.TrimSpace(strings.Split(r.Header.Get("X-Forwarded-For"), ",")[0])
-	if xff != "" {
-		if ip := net.ParseIP(xff); ip != nil {
-			return ip.String()
-		}
-	}
-	h, _, err := net.SplitHostPort(strings.TrimSpace(r.RemoteAddr))
-	if err == nil {
-		if ip := net.ParseIP(h); ip != nil {
-			return ip.String()
-		}
-	}
-	return strings.TrimSpace(r.RemoteAddr)
 }
 
 func (a *App) isBlocked(ip string) (time.Duration, bool) {
@@ -1550,84 +1489,6 @@ func (a *App) writeTargetConfig(p *Provider) error {
 		b, _ := json.MarshalIndent(m, "", "  ")
 		return os.WriteFile(dst, b, 0o600)
 	}
-}
-
-func logging(next http.Handler) http.Handler {
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		start := time.Now()
-		next.ServeHTTP(w, r)
-		log.Printf("%s %s %s", r.Method, r.URL.Path, time.Since(start))
-	})
-}
-
-func getenv(k, d string) string {
-	if v := os.Getenv(k); v != "" {
-		return v
-	}
-	return d
-}
-
-func getenvInt(k string, d int) int {
-	v := strings.TrimSpace(os.Getenv(k))
-	if v == "" {
-		return d
-	}
-	n, err := strconv.Atoi(v)
-	if err != nil {
-		return d
-	}
-	return n
-}
-
-func getenvBool(k string, d bool) bool {
-	v := strings.TrimSpace(strings.ToLower(os.Getenv(k)))
-	if v == "" {
-		return d
-	}
-	switch v {
-	case "1", "true", "yes", "on":
-		return true
-	case "0", "false", "no", "off":
-		return false
-	default:
-		return d
-	}
-}
-
-func parseIntRange(raw string, d, min, max int) int {
-	v := strings.TrimSpace(raw)
-	if v == "" {
-		return d
-	}
-	n, err := strconv.Atoi(v)
-	if err != nil {
-		return d
-	}
-	if n < min {
-		n = min
-	}
-	if n > max {
-		n = max
-	}
-	return n
-}
-
-func parseDatePrefixRFC3339(raw string, end bool) string {
-	raw = strings.TrimSpace(raw)
-	if raw == "" {
-		return ""
-	}
-	if len(raw) == 10 {
-		if end {
-			raw += "T23:59:59+08:00"
-		} else {
-			raw += "T00:00:00+08:00"
-		}
-	}
-	if t, err := time.Parse(time.RFC3339, raw); err == nil {
-		return t.Format(time.RFC3339)
-	}
-	return ""
 }
 
 func validateSaveReq(req *SaveReq) error {
