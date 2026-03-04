@@ -13,6 +13,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"regexp"
 	"sort"
 	"strconv"
 	"strings"
@@ -103,6 +104,16 @@ type SaveReq struct {
 	Notes   string `json:"notes"`
 }
 
+type importApplyResult struct {
+	Mode        string           `json:"mode"`
+	DryRun      bool             `json:"dryRun,omitempty"`
+	Imported    int              `json:"imported"`
+	Overwritten int              `json:"overwritten"`
+	Skipped     int              `json:"skipped"`
+	Details     []map[string]any `json:"details"`
+	DetailCount int              `json:"detailCount"`
+}
+
 type ProviderTestReq struct {
 	ProviderID int64  `json:"providerId"`
 	BaseURL    string `json:"baseUrl"`
@@ -167,6 +178,7 @@ func main() {
 	mux.HandleFunc("/healthz", app.handleHealth)
 	mux.HandleFunc("/api/providers", app.withAuth(app.handleProviders))
 	mux.HandleFunc("/api/providers/import", app.withAuth(app.handleProvidersImport))
+	mux.HandleFunc("/api/providers/import-cc", app.withAuth(app.handleProvidersImportCCSwitch))
 	mux.HandleFunc("/api/providers/export", app.withAuth(app.handleProvidersExport))
 	mux.HandleFunc("/api/providers/test", app.withAuth(app.handleProviderTest))
 	mux.HandleFunc("/api/providers/test-batch", app.withAuth(app.handleProviderTestBatch))
@@ -695,100 +707,51 @@ func (a *App) handleProvidersImport(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), 400)
 		return
 	}
-	if len(req.Items) == 0 {
-		http.Error(w, "items required", 400)
-		return
-	}
-	if len(req.Items) > 200 {
-		http.Error(w, "too many items (max 200)", 400)
-		return
-	}
-	mode := strings.ToLower(strings.TrimSpace(req.Mode))
-	if mode == "" {
-		mode = "skip"
-	}
-	if mode != "skip" && mode != "overwrite" {
-		http.Error(w, "mode must be skip or overwrite", 400)
-		return
-	}
-	previewLimit := req.PreviewLimit
-	if previewLimit <= 0 {
-		previewLimit = 30
-	}
-	if previewLimit > 200 {
-		previewLimit = 200
-	}
-
-	tx, err := a.db.Begin()
+	res, err := a.applyImportItems(req.Items, req.Mode, req.DryRun, req.PreviewLimit)
 	if err != nil {
-		http.Error(w, err.Error(), 500)
+		http.Error(w, err.Error(), 400)
 		return
 	}
-	defer tx.Rollback()
-
-	now := time.Now().Format(time.RFC3339)
-	imported := 0
-	overwritten := 0
-	skipped := 0
-	details := []map[string]any{}
-	for i := range req.Items {
-		it := req.Items[i]
-		if err := validateSaveReq(&it); err != nil {
-			http.Error(w, fmt.Sprintf("item[%d]: %v", i, err), 400)
-			return
-		}
-		existingID, exists, err := findProviderIDByNameTargetTx(tx, it.Name, it.Target)
-		if err != nil {
-			http.Error(w, err.Error(), 500)
-			return
-		}
-		if exists {
-			if mode == "skip" {
-				skipped++
-				if len(details) < previewLimit {
-					details = append(details, map[string]any{"index": i, "name": it.Name, "target": it.Target, "action": "skip", "existingId": existingID})
-				}
-				continue
-			}
-			overwritten++
-			if len(details) < previewLimit {
-				details = append(details, map[string]any{"index": i, "name": it.Name, "target": it.Target, "action": "overwrite", "existingId": existingID})
-			}
-			if req.DryRun {
-				continue
-			}
-			if _, err := tx.Exec(`UPDATE providers SET base_url=?,api_key=?,model=?,notes=?,updated_at=? WHERE id=?`,
-				it.BaseURL, it.APIKey, it.Model, it.Notes, now, existingID); err != nil {
-				http.Error(w, err.Error(), 500)
-				return
-			}
-			continue
-		}
-		imported++
-		if len(details) < previewLimit {
-			details = append(details, map[string]any{"index": i, "name": it.Name, "target": it.Target, "action": "insert"})
-		}
-		if req.DryRun {
-			continue
-		}
-		if _, err := tx.Exec(`INSERT INTO providers(name,target,base_url,api_key,model,notes,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?)`,
-			it.Name, it.Target, it.BaseURL, it.APIKey, it.Model, it.Notes, now, now); err != nil {
-			http.Error(w, err.Error(), 500)
-			return
-		}
-	}
+	action := "provider.import"
 	if req.DryRun {
-		_ = tx.Rollback()
-		_ = a.insertOpAudit("provider.import.preview", "batch", fmt.Sprintf("mode=%s imported=%d overwritten=%d skipped=%d", mode, imported, overwritten, skipped), clientIP(r), strings.TrimSpace(r.UserAgent()))
-		_ = json.NewEncoder(w).Encode(map[string]any{"ok": true, "dryRun": true, "mode": mode, "imported": imported, "overwritten": overwritten, "skipped": skipped, "details": details, "detailCount": len(details)})
+		action = "provider.import.preview"
+	}
+	_ = a.insertOpAudit(action, "batch", fmt.Sprintf("mode=%s imported=%d overwritten=%d skipped=%d", res.Mode, res.Imported, res.Overwritten, res.Skipped), clientIP(r), strings.TrimSpace(r.UserAgent()))
+	_ = json.NewEncoder(w).Encode(map[string]any{"ok": true, "dryRun": req.DryRun, "mode": res.Mode, "imported": res.Imported, "overwritten": res.Overwritten, "skipped": res.Skipped, "details": res.Details, "detailCount": res.DetailCount})
+}
+
+func (a *App) handleProvidersImportCCSwitch(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		w.WriteHeader(http.StatusMethodNotAllowed)
 		return
 	}
-	if err := tx.Commit(); err != nil {
-		http.Error(w, err.Error(), 500)
+	r.Body = http.MaxBytesReader(w, r.Body, 4<<20)
+	var req struct {
+		SQL          string `json:"sql"`
+		Mode         string `json:"mode"`
+		DryRun       bool   `json:"dryRun"`
+		PreviewLimit int    `json:"previewLimit"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, err.Error(), 400)
 		return
 	}
-	_ = a.insertOpAudit("provider.import", "batch", fmt.Sprintf("mode=%s imported=%d overwritten=%d skipped=%d", mode, imported, overwritten, skipped), clientIP(r), strings.TrimSpace(r.UserAgent()))
-	_ = json.NewEncoder(w).Encode(map[string]any{"ok": true, "mode": mode, "imported": imported, "overwritten": overwritten, "skipped": skipped, "details": details, "detailCount": len(details)})
+	items, err := parseCCSwitchProvidersFromSQL(req.SQL)
+	if err != nil {
+		http.Error(w, err.Error(), 400)
+		return
+	}
+	res, err := a.applyImportItems(items, req.Mode, req.DryRun, req.PreviewLimit)
+	if err != nil {
+		http.Error(w, err.Error(), 400)
+		return
+	}
+	action := "provider.import.ccswitch"
+	if req.DryRun {
+		action = "provider.import.ccswitch.preview"
+	}
+	_ = a.insertOpAudit(action, "batch", fmt.Sprintf("mode=%s parsed=%d imported=%d overwritten=%d skipped=%d", res.Mode, len(items), res.Imported, res.Overwritten, res.Skipped), clientIP(r), strings.TrimSpace(r.UserAgent()))
+	_ = json.NewEncoder(w).Encode(map[string]any{"ok": true, "parsed": len(items), "dryRun": req.DryRun, "mode": res.Mode, "imported": res.Imported, "overwritten": res.Overwritten, "skipped": res.Skipped, "details": res.Details, "detailCount": res.DetailCount})
 }
 
 func (a *App) handleProvidersExport(w http.ResponseWriter, r *http.Request) {
@@ -1193,6 +1156,240 @@ func (a *App) listProviders(q ProviderQuery) ([]Provider, error) {
 	return out, nil
 }
 
+func normalizeMode(mode string) (string, error) {
+	mode = strings.ToLower(strings.TrimSpace(mode))
+	if mode == "" {
+		mode = "skip"
+	}
+	if mode != "skip" && mode != "overwrite" {
+		return "", errors.New("mode must be skip or overwrite")
+	}
+	return mode, nil
+}
+
+func (a *App) applyImportItems(items []SaveReq, mode string, dryRun bool, previewLimit int) (*importApplyResult, error) {
+	if len(items) == 0 {
+		return nil, errors.New("items required")
+	}
+	if len(items) > 200 {
+		return nil, errors.New("too many items (max 200)")
+	}
+	m, err := normalizeMode(mode)
+	if err != nil {
+		return nil, err
+	}
+	if previewLimit <= 0 {
+		previewLimit = 30
+	}
+	if previewLimit > 200 {
+		previewLimit = 200
+	}
+
+	tx, err := a.db.Begin()
+	if err != nil {
+		return nil, err
+	}
+	defer tx.Rollback()
+
+	now := time.Now().Format(time.RFC3339)
+	res := &importApplyResult{Mode: m, DryRun: dryRun, Details: []map[string]any{}}
+	for i := range items {
+		it := items[i]
+		if err := validateSaveReq(&it); err != nil {
+			return nil, fmt.Errorf("item[%d]: %v", i, err)
+		}
+		existingID, exists, err := findProviderIDByNameTargetTx(tx, it.Name, it.Target)
+		if err != nil {
+			return nil, err
+		}
+		if exists {
+			if m == "skip" {
+				res.Skipped++
+				if len(res.Details) < previewLimit {
+					res.Details = append(res.Details, map[string]any{"index": i, "name": it.Name, "target": it.Target, "action": "skip", "existingId": existingID})
+				}
+				continue
+			}
+			res.Overwritten++
+			if len(res.Details) < previewLimit {
+				res.Details = append(res.Details, map[string]any{"index": i, "name": it.Name, "target": it.Target, "action": "overwrite", "existingId": existingID})
+			}
+			if dryRun {
+				continue
+			}
+			if _, err := tx.Exec(`UPDATE providers SET base_url=?,api_key=?,model=?,notes=?,updated_at=? WHERE id=?`,
+				it.BaseURL, it.APIKey, it.Model, it.Notes, now, existingID); err != nil {
+				return nil, err
+			}
+			continue
+		}
+		res.Imported++
+		if len(res.Details) < previewLimit {
+			res.Details = append(res.Details, map[string]any{"index": i, "name": it.Name, "target": it.Target, "action": "insert"})
+		}
+		if dryRun {
+			continue
+		}
+		if _, err := tx.Exec(`INSERT INTO providers(name,target,base_url,api_key,model,notes,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?)`,
+			it.Name, it.Target, it.BaseURL, it.APIKey, it.Model, it.Notes, now, now); err != nil {
+			return nil, err
+		}
+	}
+	if dryRun {
+		_ = tx.Rollback()
+		res.DetailCount = len(res.Details)
+		return res, nil
+	}
+	if err := tx.Commit(); err != nil {
+		return nil, err
+	}
+	res.DetailCount = len(res.Details)
+	return res, nil
+}
+
+func parseCCSwitchProvidersFromSQL(sqlText string) ([]SaveReq, error) {
+	sqlText = strings.TrimSpace(sqlText)
+	if sqlText == "" {
+		return nil, errors.New("sql required")
+	}
+	if !strings.Contains(strings.ToLower(sqlText), "insert into") || !strings.Contains(strings.ToLower(sqlText), "providers") {
+		return nil, errors.New("no providers INSERT found in SQL")
+	}
+	re := regexp.MustCompile(`(?is)INSERT\s+INTO\s+"providers"\s*\((.*?)\)\s*VALUES\s*\((.*?)\);`)
+	ms := re.FindAllStringSubmatch(sqlText, -1)
+	if len(ms) == 0 {
+		return nil, errors.New("no providers rows parsed")
+	}
+	out := []SaveReq{}
+	for _, m := range ms {
+		cols := parseSQLColumns(m[1])
+		vals := splitSQLValues(m[2])
+		if len(cols) == 0 || len(cols) != len(vals) {
+			continue
+		}
+		row := map[string]string{}
+		for i := range cols {
+			row[strings.ToLower(strings.TrimSpace(cols[i]))] = unquoteSQLValue(vals[i])
+		}
+		appType := strings.TrimSpace(row["app_type"])
+		if appType == "" {
+			continue
+		}
+		target := mapCCAppTypeToTarget(appType)
+		if target == "" {
+			continue
+		}
+		name := strings.TrimSpace(row["name"])
+		if name == "" {
+			name = strings.TrimSpace(row["id"])
+		}
+		baseURL, apiKey, model := extractCCSettings(strings.TrimSpace(row["settings_config"]))
+		notes := strings.TrimSpace(row["notes"])
+		if name == "" || baseURL == "" {
+			continue
+		}
+		out = append(out, SaveReq{Name: name, Target: target, BaseURL: baseURL, APIKey: apiKey, Model: model, Notes: notes})
+	}
+	if len(out) == 0 {
+		return nil, errors.New("parsed zero importable providers from SQL")
+	}
+	return out, nil
+}
+
+func parseSQLColumns(raw string) []string {
+	parts := strings.Split(raw, ",")
+	out := make([]string, 0, len(parts))
+	for _, p := range parts {
+		x := strings.TrimSpace(p)
+		x = strings.Trim(x, "\"")
+		out = append(out, x)
+	}
+	return out
+}
+
+func splitSQLValues(raw string) []string {
+	out := []string{}
+	var b strings.Builder
+	inQuote := false
+	for i := 0; i < len(raw); i++ {
+		ch := raw[i]
+		if ch == '\'' {
+			if inQuote && i+1 < len(raw) && raw[i+1] == '\'' {
+				b.WriteByte('\'')
+				i++
+				continue
+			}
+			inQuote = !inQuote
+			b.WriteByte(ch)
+			continue
+		}
+		if ch == ',' && !inQuote {
+			out = append(out, strings.TrimSpace(b.String()))
+			b.Reset()
+			continue
+		}
+		b.WriteByte(ch)
+	}
+	if b.Len() > 0 {
+		out = append(out, strings.TrimSpace(b.String()))
+	}
+	return out
+}
+
+func unquoteSQLValue(v string) string {
+	v = strings.TrimSpace(v)
+	if strings.EqualFold(v, "NULL") {
+		return ""
+	}
+	if len(v) >= 2 && v[0] == '\'' && v[len(v)-1] == '\'' {
+		v = v[1 : len(v)-1]
+		v = strings.ReplaceAll(v, `''`, `'`)
+		return v
+	}
+	return v
+}
+
+func mapCCAppTypeToTarget(appType string) string {
+	switch strings.ToLower(strings.TrimSpace(appType)) {
+	case "claude":
+		return "claude"
+	case "codex":
+		return "codex"
+	case "gemini":
+		return "gemini"
+	case "opencode":
+		return "openclaw"
+	default:
+		return ""
+	}
+}
+
+func extractCCSettings(raw string) (baseURL, apiKey, model string) {
+	if strings.TrimSpace(raw) == "" {
+		return "", "", ""
+	}
+	var m map[string]any
+	if err := json.Unmarshal([]byte(raw), &m); err != nil {
+		return "", "", ""
+	}
+	baseURL = firstString(m, "baseUrl", "base_url", "url", "endpoint", "apiBase", "api_base")
+	apiKey = firstString(m, "apiKey", "api_key", "token", "access_token")
+	model = firstString(m, "model", "model_id", "defaultModel")
+	return strings.TrimSpace(baseURL), strings.TrimSpace(apiKey), strings.TrimSpace(model)
+}
+
+func firstString(m map[string]any, keys ...string) string {
+	for _, k := range keys {
+		if v, ok := m[k]; ok {
+			s, _ := v.(string)
+			if strings.TrimSpace(s) != "" {
+				return s
+			}
+		}
+	}
+	return ""
+}
+
 func findProviderIDByNameTargetTx(tx *sql.Tx, name, target string) (int64, bool, error) {
 	var id int64
 	err := tx.QueryRow(`SELECT id FROM providers WHERE name=? AND target=? LIMIT 1`, name, target).Scan(&id)
@@ -1582,8 +1779,8 @@ const indexHTML = `<!doctype html>
   </div>
 
   <div class="card">
-    <h3>批量导入 Providers(JSON)</h3>
-    <p class="muted">格式：{"items":[{"name":"...","target":"openclaw","baseUrl":"https://...","apiKey":"...","model":"...","notes":"..."}]}</p>
+    <h3>批量导入 Providers(JSON / CC-Switch SQL)</h3>
+    <p class="muted">JSON格式：{"items":[{"name":"...","target":"openclaw","baseUrl":"https://...","apiKey":"...","model":"...","notes":"..."}]}</p>
     <div class="row">
       <div>
         <label>冲突策略</label>
@@ -1594,13 +1791,20 @@ const indexHTML = `<!doctype html>
         <input id="previewLimit" type="number" min="1" max="200" value="30"/>
       </div>
     </div>
-    <textarea id="importJson" rows="6" placeholder='{"items":[{"name":"demo","target":"openclaw","baseUrl":"https://cli.lyb123.top/v1","model":"gpt-5.3-codex"}]}'></textarea>
+    <label>导入 JSON</label>
+    <textarea id="importJson" rows="5" placeholder='{"items":[{"name":"demo","target":"openclaw","baseUrl":"https://cli.lyb123.top/v1","model":"gpt-5.3-codex"}]}'></textarea>
     <div class="actions">
-      <button onclick="previewImportProviders()">预检（dry-run）</button>
-      <button onclick="importProviders()">导入</button>
+      <button onclick="previewImportProviders()">JSON预检（dry-run）</button>
+      <button onclick="importProviders()">JSON导入</button>
       <button class="ghost" onclick="exportProviders()">导出当前筛选 JSON</button>
       <button class="ghost" onclick="exportLastImportJson()">导出最近导入结果(JSON)</button>
       <button class="ghost" onclick="exportLastImportCsv()">导出最近导入结果(CSV)</button>
+    </div>
+    <label>导入 CC-Switch SQLite 导出 SQL（粘贴文本）</label>
+    <textarea id="ccSwitchSql" rows="5" placeholder="-- CC Switch SQLite 导出...\nINSERT INTO \"providers\" ..."></textarea>
+    <div class="actions">
+      <button onclick="previewImportCCSwitch()">CC预检（dry-run）</button>
+      <button onclick="importCCSwitch()">CC导入</button>
     </div>
   </div>
 
@@ -1832,6 +2036,30 @@ async function previewImportProviders(){
   lastImportResult = r;
   const details = (r.details||[]).slice(0,10).map(x=>('['+x.action+'] '+x.target+'/'+x.name+(x.existingId?(' -> #'+x.existingId):''))).join('\n');
   alert('预检完成（不落库）\n新增 '+(r.imported||0)+'，覆盖 '+(r.overwritten||0)+'，跳过 '+(r.skipped||0)+'，模式 '+(r.mode||'') + (details?('\n\n样例:\n'+details):''));
+  await loadOpAudits();
+}
+
+async function previewImportCCSwitch(){
+  const sql = (document.getElementById('ccSwitchSql').value || '').trim();
+  if(!sql){ alert('请先粘贴 CC-Switch SQLite 导出 SQL'); return; }
+  const mode = (document.getElementById('importMode').value || 'skip');
+  const previewLimit = Number(document.getElementById('previewLimit').value || 30);
+  const r = await api('/api/providers/import-cc',{method:'POST',body:JSON.stringify({sql,mode,dryRun:true,previewLimit})});
+  lastImportResult = r;
+  const details = (r.details||[]).slice(0,10).map(x=>('['+x.action+'] '+x.target+'/'+x.name+(x.existingId?(' -> #'+x.existingId):''))).join('\n');
+  alert('CC 预检完成（不落库）\n解析 '+(r.parsed||0)+' 条，新增 '+(r.imported||0)+'，覆盖 '+(r.overwritten||0)+'，跳过 '+(r.skipped||0)+'，模式 '+(r.mode||'') + (details?('\n\n样例:\n'+details):''));
+  await loadOpAudits();
+}
+
+async function importCCSwitch(){
+  const sql = (document.getElementById('ccSwitchSql').value || '').trim();
+  if(!sql){ alert('请先粘贴 CC-Switch SQLite 导出 SQL'); return; }
+  const mode = (document.getElementById('importMode').value || 'skip');
+  const previewLimit = Number(document.getElementById('previewLimit').value || 30);
+  const r = await api('/api/providers/import-cc',{method:'POST',body:JSON.stringify({sql,mode,dryRun:false,previewLimit})});
+  lastImportResult = r;
+  alert('CC 导入完成：解析 '+(r.parsed||0)+'，新增 '+(r.imported||0)+'，覆盖 '+(r.overwritten||0)+'，跳过 '+(r.skipped||0)+'，模式 '+(r.mode||''));
+  await loadProviders();
   await loadOpAudits();
 }
 
