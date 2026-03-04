@@ -584,8 +584,10 @@ func (a *App) handleProvidersImport(w http.ResponseWriter, r *http.Request) {
 	}
 	r.Body = http.MaxBytesReader(w, r.Body, 1<<20)
 	var req struct {
-		Items []SaveReq `json:"items"`
-		Mode  string    `json:"mode"` // skip|overwrite
+		Items        []SaveReq `json:"items"`
+		Mode         string    `json:"mode"` // skip|overwrite
+		DryRun       bool      `json:"dryRun"`
+		PreviewLimit int       `json:"previewLimit"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		http.Error(w, err.Error(), 400)
@@ -607,6 +609,13 @@ func (a *App) handleProvidersImport(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "mode must be skip or overwrite", 400)
 		return
 	}
+	previewLimit := req.PreviewLimit
+	if previewLimit <= 0 {
+		previewLimit = 30
+	}
+	if previewLimit > 200 {
+		previewLimit = 200
+	}
 
 	tx, err := a.db.Begin()
 	if err != nil {
@@ -619,6 +628,7 @@ func (a *App) handleProvidersImport(w http.ResponseWriter, r *http.Request) {
 	imported := 0
 	overwritten := 0
 	skipped := 0
+	details := []map[string]any{}
 	for i := range req.Items {
 		it := req.Items[i]
 		if err := validateSaveReq(&it); err != nil {
@@ -633,6 +643,16 @@ func (a *App) handleProvidersImport(w http.ResponseWriter, r *http.Request) {
 		if exists {
 			if mode == "skip" {
 				skipped++
+				if len(details) < previewLimit {
+					details = append(details, map[string]any{"index": i, "name": it.Name, "target": it.Target, "action": "skip", "existingId": existingID})
+				}
+				continue
+			}
+			overwritten++
+			if len(details) < previewLimit {
+				details = append(details, map[string]any{"index": i, "name": it.Name, "target": it.Target, "action": "overwrite", "existingId": existingID})
+			}
+			if req.DryRun {
 				continue
 			}
 			if _, err := tx.Exec(`UPDATE providers SET base_url=?,api_key=?,model=?,notes=?,updated_at=? WHERE id=?`,
@@ -640,7 +660,13 @@ func (a *App) handleProvidersImport(w http.ResponseWriter, r *http.Request) {
 				http.Error(w, err.Error(), 500)
 				return
 			}
-			overwritten++
+			continue
+		}
+		imported++
+		if len(details) < previewLimit {
+			details = append(details, map[string]any{"index": i, "name": it.Name, "target": it.Target, "action": "insert"})
+		}
+		if req.DryRun {
 			continue
 		}
 		if _, err := tx.Exec(`INSERT INTO providers(name,target,base_url,api_key,model,notes,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?)`,
@@ -648,14 +674,19 @@ func (a *App) handleProvidersImport(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, err.Error(), 500)
 			return
 		}
-		imported++
+	}
+	if req.DryRun {
+		_ = tx.Rollback()
+		_ = a.insertOpAudit("provider.import.preview", "batch", fmt.Sprintf("mode=%s imported=%d overwritten=%d skipped=%d", mode, imported, overwritten, skipped), clientIP(r), strings.TrimSpace(r.UserAgent()))
+		_ = json.NewEncoder(w).Encode(map[string]any{"ok": true, "dryRun": true, "mode": mode, "imported": imported, "overwritten": overwritten, "skipped": skipped, "details": details, "detailCount": len(details)})
+		return
 	}
 	if err := tx.Commit(); err != nil {
 		http.Error(w, err.Error(), 500)
 		return
 	}
 	_ = a.insertOpAudit("provider.import", "batch", fmt.Sprintf("mode=%s imported=%d overwritten=%d skipped=%d", mode, imported, overwritten, skipped), clientIP(r), strings.TrimSpace(r.UserAgent()))
-	_ = json.NewEncoder(w).Encode(map[string]any{"ok": true, "mode": mode, "imported": imported, "overwritten": overwritten, "skipped": skipped})
+	_ = json.NewEncoder(w).Encode(map[string]any{"ok": true, "mode": mode, "imported": imported, "overwritten": overwritten, "skipped": skipped, "details": details, "detailCount": len(details)})
 }
 
 func (a *App) handleProvidersExport(w http.ResponseWriter, r *http.Request) {
@@ -1396,9 +1427,20 @@ const indexHTML = `<!doctype html>
 
   <div class="card">
     <h3>批量导入 Providers(JSON)</h3>
-    <p class="muted">格式：{"items":[{"name":"...","target":"openclaw","baseUrl":"https://...","apiKey":"...","model":"...","notes":"..."}],"mode":"skip|overwrite"}</p>
-    <textarea id="importJson" rows="6" placeholder='{"items":[{"name":"demo","target":"openclaw","baseUrl":"https://cli.lyb123.top/v1","model":"gpt-5.3-codex"}],"mode":"skip"}'></textarea>
+    <p class="muted">格式：{"items":[{"name":"...","target":"openclaw","baseUrl":"https://...","apiKey":"...","model":"...","notes":"..."}]}</p>
+    <div class="row">
+      <div>
+        <label>冲突策略</label>
+        <select id="importMode"><option value="skip">skip（冲突跳过）</option><option value="overwrite">overwrite（冲突覆盖）</option></select>
+      </div>
+      <div>
+        <label>预检明细上限</label>
+        <input id="previewLimit" type="number" min="1" max="200" value="30"/>
+      </div>
+    </div>
+    <textarea id="importJson" rows="6" placeholder='{"items":[{"name":"demo","target":"openclaw","baseUrl":"https://cli.lyb123.top/v1","model":"gpt-5.3-codex"}]}'></textarea>
     <div class="actions">
+      <button onclick="previewImportProviders()">预检（dry-run）</button>
       <button onclick="importProviders()">导入</button>
       <button class="ghost" onclick="exportProviders()">导出当前筛选 JSON</button>
     </div>
@@ -1577,9 +1619,26 @@ async function importProviders(){
   if(!raw){ alert('请先粘贴 JSON'); return; }
   let obj;
   try{ obj = JSON.parse(raw); }catch(e){ alert('JSON 格式错误: '+e.message); return; }
+  obj.mode = (document.getElementById('importMode').value || 'skip');
+  obj.previewLimit = Number(document.getElementById('previewLimit').value || 30);
+  obj.dryRun = false;
   const r = await api('/api/providers/import',{method:'POST',body:JSON.stringify(obj)});
   alert('导入完成: 新增 '+(r.imported||0)+'，覆盖 '+(r.overwritten||0)+'，跳过 '+(r.skipped||0)+'，模式 '+(r.mode||''));
   await loadProviders();
+  await loadOpAudits();
+}
+
+async function previewImportProviders(){
+  const raw = (document.getElementById('importJson').value || '').trim();
+  if(!raw){ alert('请先粘贴 JSON'); return; }
+  let obj;
+  try{ obj = JSON.parse(raw); }catch(e){ alert('JSON 格式错误: '+e.message); return; }
+  obj.mode = (document.getElementById('importMode').value || 'skip');
+  obj.previewLimit = Number(document.getElementById('previewLimit').value || 30);
+  obj.dryRun = true;
+  const r = await api('/api/providers/import',{method:'POST',body:JSON.stringify(obj)});
+  const details = (r.details||[]).slice(0,10).map(x=>('['+x.action+'] '+x.target+'/'+x.name+(x.existingId?(' -> #'+x.existingId):''))).join('\n');
+  alert('预检完成（不落库）\n新增 '+(r.imported||0)+'，覆盖 '+(r.overwritten||0)+'，跳过 '+(r.skipped||0)+'，模式 '+(r.mode||'') + (details?('\n\n样例:\n'+details):''));
   await loadOpAudits();
 }
 
