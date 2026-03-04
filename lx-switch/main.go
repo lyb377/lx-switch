@@ -23,16 +23,17 @@ import (
 )
 
 type App struct {
-	db                *sql.DB
-	dataDir           string
-	backupDir         string
-	adminToken        string
-	failed            map[string]*attemptState
-	mu                sync.Mutex
-	maxAttempts       int
-	window            time.Duration
-	lockout           time.Duration
-	maxLoginBodyBytes int64
+	db                 *sql.DB
+	dataDir            string
+	backupDir          string
+	adminToken         string
+	failed             map[string]*attemptState
+	mu                 sync.Mutex
+	maxAttempts        int
+	window             time.Duration
+	lockout            time.Duration
+	maxLoginBodyBytes  int64
+	auditRetentionDays int
 }
 
 type attemptState struct {
@@ -136,15 +137,16 @@ func main() {
 	}
 
 	app := &App{
-		db:                db,
-		dataDir:           dataDir,
-		backupDir:         backupDir,
-		adminToken:        token,
-		failed:            map[string]*attemptState{},
-		maxAttempts:       getenvInt("LX_SWITCH_MAX_LOGIN_ATTEMPTS", 6),
-		window:            time.Duration(getenvInt("LX_SWITCH_LOGIN_WINDOW_SEC", 300)) * time.Second,
-		lockout:           time.Duration(getenvInt("LX_SWITCH_LOGIN_LOCK_SEC", 900)) * time.Second,
-		maxLoginBodyBytes: int64(getenvInt("LX_SWITCH_LOGIN_MAX_BODY", 4096)),
+		db:                 db,
+		dataDir:            dataDir,
+		backupDir:          backupDir,
+		adminToken:         token,
+		failed:             map[string]*attemptState{},
+		maxAttempts:        getenvInt("LX_SWITCH_MAX_LOGIN_ATTEMPTS", 6),
+		window:             time.Duration(getenvInt("LX_SWITCH_LOGIN_WINDOW_SEC", 300)) * time.Second,
+		lockout:            time.Duration(getenvInt("LX_SWITCH_LOGIN_LOCK_SEC", 900)) * time.Second,
+		maxLoginBodyBytes:  int64(getenvInt("LX_SWITCH_LOGIN_MAX_BODY", 4096)),
+		auditRetentionDays: getenvInt("LX_SWITCH_AUDIT_RETENTION_DAYS", 30),
 	}
 	if err := app.initDB(); err != nil {
 		log.Fatal(err)
@@ -169,6 +171,7 @@ func main() {
 	mux.HandleFunc("/api/login-audits/export", app.withAuth(app.handleLoginAuditsExport))
 	mux.HandleFunc("/api/op-audits", app.withAuth(app.handleOpAudits))
 	mux.HandleFunc("/api/op-audits/export", app.withAuth(app.handleOpAuditsExport))
+	mux.HandleFunc("/api/audits/cleanup", app.withAuth(app.handleAuditsCleanup))
 
 	srv := &http.Server{Addr: listen, Handler: logging(mux)}
 	log.Printf("lx-switch listening on %s, data=%s", listen, dataDir)
@@ -420,10 +423,11 @@ func (a *App) handleMeta(w http.ResponseWriter, r *http.Request) {
 	active, _ := a.getState("active_provider")
 	cnt, _ := a.countProviders()
 	_ = json.NewEncoder(w).Encode(map[string]any{
-		"activeProvider": active,
-		"providerCount":  cnt,
-		"firstRun":       cnt == 0,
-		"tokenWeak":      a.adminToken == "change-me-please",
+		"activeProvider":     active,
+		"providerCount":      cnt,
+		"firstRun":           cnt == 0,
+		"tokenWeak":          a.adminToken == "change-me-please",
+		"auditRetentionDays": a.auditRetentionDays,
 	})
 }
 
@@ -537,6 +541,30 @@ func (a *App) handleOpAuditsExport(w http.ResponseWriter, r *http.Request) {
 		)
 		_, _ = io.WriteString(w, line)
 	}
+}
+
+func (a *App) handleAuditsCleanup(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		w.WriteHeader(http.StatusMethodNotAllowed)
+		return
+	}
+	keepDays := parseIntRange(r.URL.Query().Get("keepDays"), a.auditRetentionDays, 1, 3650)
+	cutoff := time.Now().Add(-time.Duration(keepDays) * 24 * time.Hour).Format(time.RFC3339)
+
+	res1, err := a.db.Exec(`DELETE FROM login_audits WHERE created_at < ?`, cutoff)
+	if err != nil {
+		http.Error(w, err.Error(), 500)
+		return
+	}
+	res2, err := a.db.Exec(`DELETE FROM op_audits WHERE created_at < ?`, cutoff)
+	if err != nil {
+		http.Error(w, err.Error(), 500)
+		return
+	}
+	l1, _ := res1.RowsAffected()
+	l2, _ := res2.RowsAffected()
+	_ = a.insertOpAudit("audit.cleanup", "audits", fmt.Sprintf("keepDays=%d loginDeleted=%d opDeleted=%d", keepDays, l1, l2), clientIP(r), strings.TrimSpace(r.UserAgent()))
+	_ = json.NewEncoder(w).Encode(map[string]any{"ok": true, "keepDays": keepDays, "cutoff": cutoff, "loginDeleted": l1, "opDeleted": l2, "totalDeleted": l1 + l2})
 }
 
 func (a *App) handleProviders(w http.ResponseWriter, r *http.Request) {
@@ -1372,6 +1400,7 @@ const indexHTML = `<!doctype html>
   <div id="firstRun" class="ok hide"></div>
   <div id="weakToken" class="warn hide"></div>
   <div id="activeProvider" class="ok hide"></div>
+  <div id="auditRetention" class="muted"></div>
 
   <div class="card">
     <div style="display:flex;justify-content:space-between;align-items:center;gap:10px;">
@@ -1475,6 +1504,7 @@ const indexHTML = `<!doctype html>
       <button onclick="nextOpPage()">下一页</button>
       <button class="ghost" onclick="loadOpAudits()">刷新操作日志</button>
       <button class="ghost" onclick="exportOpAudits()">导出 CSV</button>
+      <button class="ghost" onclick="cleanupAudits()">清理旧审计</button>
     </div>
     <div class="row">
       <div>
@@ -1571,6 +1601,9 @@ async function loadMeta(){
   }else{
     setBox('activeProvider','当前尚未激活 Provider');
   }
+  const ard = Number(m.auditRetentionDays||0);
+  const ar = document.getElementById('auditRetention');
+  if(ar){ ar.textContent = ard>0 ? ('审计默认保留天数：'+ard+' 天') : ''; }
 }
 
 async function loadProviders(){
@@ -1837,6 +1870,20 @@ function clearOpFilter(){
 function exportOpAudits(){
   const q='limit=2000&action='+encodeURIComponent(opActionFilter)+'&target='+encodeURIComponent(opTargetFilter);
   window.open('/api/op-audits/export?'+q,'_blank');
+}
+
+async function cleanupAudits(){
+  const raw = prompt('保留最近多少天审计记录？（默认 30）','30');
+  if(raw===null) return;
+  const keep = Number(raw||30);
+  if(!Number.isFinite(keep) || keep<1){ alert('请输入 >=1 的天数'); return; }
+  if(!confirm('将删除早于 '+keep+' 天的登录/操作审计，确定继续？')) return;
+  const r = await api('/api/audits/cleanup?keepDays='+encodeURIComponent(String(Math.floor(keep))),{method:'POST'});
+  alert('清理完成：login '+(r.loginDeleted||0)+' 条，op '+(r.opDeleted||0)+' 条，总计 '+(r.totalDeleted||0));
+  auditOffset = 0;
+  opOffset = 0;
+  await loadAudits();
+  await loadOpAudits();
 }
 
 async function loadAll(){
