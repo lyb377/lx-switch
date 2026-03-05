@@ -146,6 +146,10 @@ Body:
 Query:
 - `limit` (default 50)
 - `offset` (default 0)
+- `from` (optional, 计划支持：`YYYY-MM-DD` 或 RFC3339)
+- `to` (optional, 计划支持：`YYYY-MM-DD` 或 RFC3339)
+
+> 说明：`from/to` 当前处于 M3 收尾阶段，若服务版本未包含该能力则会忽略该参数或返回参数错误。
 
 ### GET /api/login-audits/export
 
@@ -153,6 +157,8 @@ Query:
 
 Query:
 - `limit` (default 2000)
+- `from` (optional, 计划支持)
+- `to` (optional, 计划支持)
 
 ### GET /api/op-audits
 
@@ -215,3 +221,12 @@ Body:
 - `401`：未授权
 - `405`：方法不允许
 - `500`：服务内部错误
+
+---
+
+## 联调约定（前后端）
+
+- 列表查询与导出接口必须使用同一组筛选参数语义
+- 日期过滤推荐统一入参：`YYYY-MM-DD` 或 RFC3339
+- 新增字段保持向后兼容（前端可忽略未知字段）
+- 破坏性变更需提前在文档与 PR 中声明
