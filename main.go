@@ -70,6 +70,13 @@ type LoginAudit struct {
 	CreatedAt time.Time `json:"createdAt"`
 }
 
+type LoginAuditQuery struct {
+	Limit  int
+	Offset int
+	From   string
+	To     string
+}
+
 type OpAuditQuery struct {
 	Limit  int
 	Offset int
@@ -111,6 +118,25 @@ type importApplyResult struct {
 	Skipped     int              `json:"skipped"`
 	Details     []map[string]any `json:"details"`
 	DetailCount int              `json:"detailCount"`
+}
+
+type CCImportRowReport struct {
+	RowIndex     int    `json:"rowIndex"`
+	Name         string `json:"name"`
+	AppType      string `json:"appType"`
+	MappedTarget string `json:"mappedTarget"`
+	Status       string `json:"status"` // importable|skipped
+	Reason       string `json:"reason"`
+	BaseURL      string `json:"baseUrl"`
+	Model        string `json:"model"`
+}
+
+type CCImportMappingReport struct {
+	TotalRows      int                 `json:"totalRows"`
+	ImportableRows int                 `json:"importableRows"`
+	SkippedRows    int                 `json:"skippedRows"`
+	TargetMapped   map[string]int      `json:"targetMapped"`
+	Rows           []CCImportRowReport `json:"rows"`
 }
 
 type ProviderTestReq struct {
@@ -195,6 +221,7 @@ func (a *App) newMux() *http.ServeMux {
 	mux.HandleFunc("/api/providers", a.withAuth(a.handleProviders))
 	mux.HandleFunc("/api/providers/import", a.withAuth(a.handleProvidersImport))
 	mux.HandleFunc("/api/providers/import-cc", a.withAuth(a.handleProvidersImportCCSwitch))
+	mux.HandleFunc("/api/providers/import-cc/report", a.withAuth(a.handleProvidersImportCCSwitchReport))
 	mux.HandleFunc("/api/providers/export", a.withAuth(a.handleProvidersExport))
 	mux.HandleFunc("/api/providers/test", a.withAuth(a.handleProviderTest))
 	mux.HandleFunc("/api/providers/test-batch", a.withAuth(a.handleProviderTestBatch))
@@ -408,14 +435,13 @@ func (a *App) handleLoginAudits(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusMethodNotAllowed)
 		return
 	}
-	limit := parseIntRange(r.URL.Query().Get("limit"), 50, 1, 200)
-	offset := parseIntRange(r.URL.Query().Get("offset"), 0, 0, 1_000_000)
-	list, err := a.listLoginAudits(limit, offset)
+	q := parseLoginAuditQuery(r)
+	list, err := a.listLoginAudits(q)
 	if err != nil {
 		http.Error(w, err.Error(), 500)
 		return
 	}
-	total, err := a.countLoginAudits()
+	total, err := a.countLoginAudits(q)
 	if err != nil {
 		http.Error(w, err.Error(), 500)
 		return
@@ -423,8 +449,10 @@ func (a *App) handleLoginAudits(w http.ResponseWriter, r *http.Request) {
 	_ = json.NewEncoder(w).Encode(map[string]any{
 		"items":  list,
 		"total":  total,
-		"limit":  limit,
-		"offset": offset,
+		"limit":  q.Limit,
+		"offset": q.Offset,
+		"from":   q.From,
+		"to":     q.To,
 	})
 }
 
@@ -433,8 +461,10 @@ func (a *App) handleLoginAuditsExport(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusMethodNotAllowed)
 		return
 	}
-	limit := parseIntRange(r.URL.Query().Get("limit"), 500, 1, 5000)
-	list, err := a.listLoginAudits(limit, 0)
+	q := parseLoginAuditQuery(r)
+	q.Offset = 0
+	q.Limit = parseIntRange(r.URL.Query().Get("limit"), 500, 1, 5000)
+	list, err := a.listLoginAudits(q)
 	if err != nil {
 		http.Error(w, err.Error(), 500)
 		return
@@ -686,7 +716,7 @@ func (a *App) handleProvidersImportCCSwitch(w http.ResponseWriter, r *http.Reque
 		http.Error(w, err.Error(), 400)
 		return
 	}
-	items, err := parseCCSwitchProvidersFromSQL(req.SQL)
+	items, report, err := parseCCSwitchProvidersFromSQL(req.SQL)
 	if err != nil {
 		http.Error(w, err.Error(), 400)
 		return
@@ -700,8 +730,53 @@ func (a *App) handleProvidersImportCCSwitch(w http.ResponseWriter, r *http.Reque
 	if req.DryRun {
 		action = "provider.import.ccswitch.preview"
 	}
-	_ = a.insertOpAudit(action, "batch", fmt.Sprintf("mode=%s parsed=%d imported=%d overwritten=%d skipped=%d", res.Mode, len(items), res.Imported, res.Overwritten, res.Skipped), clientIP(r), strings.TrimSpace(r.UserAgent()))
-	_ = json.NewEncoder(w).Encode(map[string]any{"ok": true, "parsed": len(items), "dryRun": req.DryRun, "mode": res.Mode, "imported": res.Imported, "overwritten": res.Overwritten, "skipped": res.Skipped, "details": res.Details, "detailCount": res.DetailCount})
+	reportJSON, _ := json.Marshal(report)
+	_ = a.insertOpAudit(action, "batch", fmt.Sprintf("mode=%s parsed=%d imported=%d overwritten=%d skipped=%d report=%s", res.Mode, len(items), res.Imported, res.Overwritten, res.Skipped, trimForAudit(string(reportJSON))), clientIP(r), strings.TrimSpace(r.UserAgent()))
+	_ = json.NewEncoder(w).Encode(map[string]any{"ok": true, "parsed": len(items), "dryRun": req.DryRun, "mode": res.Mode, "imported": res.Imported, "overwritten": res.Overwritten, "skipped": res.Skipped, "details": res.Details, "detailCount": res.DetailCount, "mappingReport": report})
+}
+
+func (a *App) handleProvidersImportCCSwitchReport(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		w.WriteHeader(http.StatusMethodNotAllowed)
+		return
+	}
+	r.Body = http.MaxBytesReader(w, r.Body, 4<<20)
+	var req struct {
+		SQL string `json:"sql"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, err.Error(), 400)
+		return
+	}
+	_, report, err := parseCCSwitchProvidersFromSQL(req.SQL)
+	if err != nil {
+		http.Error(w, err.Error(), 400)
+		return
+	}
+	stamp := time.Now().Format("20060102-150405")
+	w.Header().Set("Content-Type", "text/csv; charset=utf-8")
+	w.Header().Set("Content-Disposition", fmt.Sprintf("attachment; filename=cc-switch-mapping-report-%s.csv", stamp))
+	_, _ = io.WriteString(w, "row_index,name,app_type,mapped_target,status,reason,base_url,model\n")
+	for _, row := range report.Rows {
+		line := fmt.Sprintf("%d,%s,%s,%s,%s,%s,%s,%s\n",
+			row.RowIndex,
+			csvEsc(row.Name),
+			csvEsc(row.AppType),
+			csvEsc(row.MappedTarget),
+			csvEsc(row.Status),
+			csvEsc(row.Reason),
+			csvEsc(row.BaseURL),
+			csvEsc(row.Model),
+		)
+		_, _ = io.WriteString(w, line)
+	}
+	_, _ = io.WriteString(w, "\nsummary_key,summary_value\n")
+	_, _ = io.WriteString(w, fmt.Sprintf("total_rows,%d\n", report.TotalRows))
+	_, _ = io.WriteString(w, fmt.Sprintf("importable_rows,%d\n", report.ImportableRows))
+	_, _ = io.WriteString(w, fmt.Sprintf("skipped_rows,%d\n", report.SkippedRows))
+	for k, v := range report.TargetMapped {
+		_, _ = io.WriteString(w, fmt.Sprintf("target_%s,%d\n", k, v))
+	}
 }
 
 func (a *App) handleProvidersExport(w http.ResponseWriter, r *http.Request) {
@@ -972,14 +1047,36 @@ func (a *App) insertLoginAudit(ip, ua string, success bool, reason string) error
 	return err
 }
 
-func (a *App) countLoginAudits() (int, error) {
+func (a *App) countLoginAudits(q LoginAuditQuery) (int, error) {
 	var n int
-	err := a.db.QueryRow(`SELECT COUNT(1) FROM login_audits`).Scan(&n)
+	query := `SELECT COUNT(1) FROM login_audits WHERE 1=1`
+	args := []any{}
+	if q.From != "" {
+		query += ` AND created_at >= ?`
+		args = append(args, q.From)
+	}
+	if q.To != "" {
+		query += ` AND created_at <= ?`
+		args = append(args, q.To)
+	}
+	err := a.db.QueryRow(query, args...).Scan(&n)
 	return n, err
 }
 
-func (a *App) listLoginAudits(limit, offset int) ([]LoginAudit, error) {
-	rows, err := a.db.Query(`SELECT id,ip,user_agent,success,reason,created_at FROM login_audits ORDER BY id DESC LIMIT ? OFFSET ?`, limit, offset)
+func (a *App) listLoginAudits(q LoginAuditQuery) ([]LoginAudit, error) {
+	query := `SELECT id,ip,user_agent,success,reason,created_at FROM login_audits WHERE 1=1`
+	args := []any{}
+	if q.From != "" {
+		query += ` AND created_at >= ?`
+		args = append(args, q.From)
+	}
+	if q.To != "" {
+		query += ` AND created_at <= ?`
+		args = append(args, q.To)
+	}
+	query += ` ORDER BY id DESC LIMIT ? OFFSET ?`
+	args = append(args, q.Limit, q.Offset)
+	rows, err := a.db.Query(query, args...)
 	if err != nil {
 		return nil, err
 	}
@@ -995,6 +1092,9 @@ func (a *App) listLoginAudits(limit, offset int) ([]LoginAudit, error) {
 		it.Success = ok == 1
 		it.CreatedAt, _ = time.Parse(time.RFC3339, ts)
 		out = append(out, it)
+	}
+	if out == nil {
+		out = []LoginAudit{}
 	}
 	return out, nil
 }
@@ -1197,62 +1297,161 @@ func (a *App) applyImportItems(items []SaveReq, mode string, dryRun bool, previe
 	return res, nil
 }
 
-func parseCCSwitchProvidersFromSQL(sqlText string) ([]SaveReq, error) {
+func parseCCSwitchProvidersFromSQL(sqlText string) ([]SaveReq, CCImportMappingReport, error) {
 	sqlText = strings.TrimSpace(sqlText)
+	report := CCImportMappingReport{TargetMapped: map[string]int{}, Rows: []CCImportRowReport{}}
 	if sqlText == "" {
-		return nil, errors.New("sql required")
+		return nil, report, errors.New("sql required")
 	}
 	if !strings.Contains(strings.ToLower(sqlText), "insert into") || !strings.Contains(strings.ToLower(sqlText), "providers") {
-		return nil, errors.New("no providers INSERT found in SQL")
+		return nil, report, errors.New("no providers INSERT found in SQL")
 	}
-	re := regexp.MustCompile(`(?is)INSERT\s+INTO\s+"providers"\s*\((.*?)\)\s*VALUES\s*\((.*?)\);`)
-	ms := re.FindAllStringSubmatch(sqlText, -1)
-	if len(ms) == 0 {
-		return nil, errors.New("no providers rows parsed")
+	stmts := parseCCProviderInsertStatements(sqlText)
+	if len(stmts) == 0 {
+		return nil, report, errors.New("no providers rows parsed")
 	}
 	out := []SaveReq{}
-	for _, m := range ms {
-		cols := parseSQLColumns(m[1])
-		vals := splitSQLValues(m[2])
-		if len(cols) == 0 || len(cols) != len(vals) {
+	rowIdx := 0
+	for _, st := range stmts {
+		cols := parseSQLColumns(st.ColumnsRaw)
+		if len(cols) == 0 {
 			continue
 		}
-		row := map[string]string{}
-		for i := range cols {
-			row[strings.ToLower(strings.TrimSpace(cols[i]))] = unquoteSQLValue(vals[i])
+		tuples := splitSQLTuples(st.ValuesRaw)
+		for _, tuple := range tuples {
+			rowIdx++
+			rec := CCImportRowReport{RowIndex: rowIdx}
+			vals := splitSQLValues(tuple)
+			if len(vals) == 0 || len(vals) != len(cols) {
+				rec.Status = "skipped"
+				rec.Reason = "columns_values_mismatch"
+				report.Rows = append(report.Rows, rec)
+				continue
+			}
+			row := map[string]string{}
+			for i := range cols {
+				row[strings.ToLower(strings.TrimSpace(cols[i]))] = unquoteSQLValue(vals[i])
+			}
+			rec.Name = strings.TrimSpace(row["name"])
+			rec.AppType = strings.TrimSpace(row["app_type"])
+			if rec.Name == "" {
+				rec.Name = strings.TrimSpace(row["id"])
+			}
+			if rec.AppType == "" {
+				rec.Status = "skipped"
+				rec.Reason = "missing_app_type"
+				report.Rows = append(report.Rows, rec)
+				continue
+			}
+			target := mapCCAppTypeToTarget(rec.AppType)
+			rec.MappedTarget = target
+			if target == "" {
+				rec.Status = "skipped"
+				rec.Reason = "unsupported_app_type"
+				report.Rows = append(report.Rows, rec)
+				continue
+			}
+			baseURL, apiKey, model := extractCCSettings(strings.TrimSpace(row["settings_config"]))
+			rec.BaseURL = baseURL
+			rec.Model = model
+			if strings.TrimSpace(rec.Name) == "" {
+				rec.Status = "skipped"
+				rec.Reason = "missing_name"
+				report.Rows = append(report.Rows, rec)
+				continue
+			}
+			if strings.TrimSpace(baseURL) == "" {
+				rec.Status = "skipped"
+				rec.Reason = "missing_base_url"
+				report.Rows = append(report.Rows, rec)
+				continue
+			}
+			notes := strings.TrimSpace(row["notes"])
+			out = append(out, SaveReq{Name: rec.Name, Target: target, BaseURL: baseURL, APIKey: apiKey, Model: model, Notes: notes})
+			rec.Status = "importable"
+			rec.Reason = "ok"
+			report.TargetMapped[target]++
+			report.Rows = append(report.Rows, rec)
 		}
-		appType := strings.TrimSpace(row["app_type"])
-		if appType == "" {
-			continue
-		}
-		target := mapCCAppTypeToTarget(appType)
-		if target == "" {
-			continue
-		}
-		name := strings.TrimSpace(row["name"])
-		if name == "" {
-			name = strings.TrimSpace(row["id"])
-		}
-		baseURL, apiKey, model := extractCCSettings(strings.TrimSpace(row["settings_config"]))
-		notes := strings.TrimSpace(row["notes"])
-		if name == "" || baseURL == "" {
-			continue
-		}
-		out = append(out, SaveReq{Name: name, Target: target, BaseURL: baseURL, APIKey: apiKey, Model: model, Notes: notes})
 	}
+	report.TotalRows = len(report.Rows)
+	report.ImportableRows = len(out)
+	report.SkippedRows = report.TotalRows - report.ImportableRows
 	if len(out) == 0 {
-		return nil, errors.New("parsed zero importable providers from SQL")
+		return nil, report, errors.New("parsed zero importable providers from SQL")
 	}
-	return out, nil
+	return out, report, nil
+}
+
+type ccProviderInsertStmt struct {
+	ColumnsRaw string
+	ValuesRaw  string
+}
+
+func parseCCProviderInsertStatements(sqlText string) []ccProviderInsertStmt {
+	re := regexp.MustCompile(`(?is)INSERT\s+INTO\s+["\x60\[]?providers["\x60\]]?\s*\((.*?)\)\s*VALUES\s*(.*?);`)
+	ms := re.FindAllStringSubmatch(sqlText, -1)
+	out := make([]ccProviderInsertStmt, 0, len(ms))
+	for _, m := range ms {
+		if len(m) < 3 {
+			continue
+		}
+		out = append(out, ccProviderInsertStmt{ColumnsRaw: m[1], ValuesRaw: m[2]})
+	}
+	return out
 }
 
 func parseSQLColumns(raw string) []string {
-	parts := strings.Split(raw, ",")
+	parts := splitSQLValues(raw)
 	out := make([]string, 0, len(parts))
 	for _, p := range parts {
 		x := strings.TrimSpace(p)
 		x = strings.Trim(x, "\"")
-		out = append(out, x)
+		x = strings.Trim(x, "`")
+		x = strings.TrimPrefix(x, "[")
+		x = strings.TrimSuffix(x, "]")
+		if x != "" {
+			out = append(out, x)
+		}
+	}
+	return out
+}
+
+func splitSQLTuples(raw string) []string {
+	out := []string{}
+	raw = strings.TrimSpace(raw)
+	start := -1
+	depth := 0
+	inSingle := false
+	for i := 0; i < len(raw); i++ {
+		ch := raw[i]
+		if ch == '\'' {
+			if inSingle && i+1 < len(raw) && raw[i+1] == '\'' {
+				i++
+				continue
+			}
+			inSingle = !inSingle
+			continue
+		}
+		if inSingle {
+			continue
+		}
+		if ch == '(' {
+			if depth == 0 {
+				start = i + 1
+			}
+			depth++
+			continue
+		}
+		if ch == ')' {
+			if depth > 0 {
+				depth--
+				if depth == 0 && start >= 0 && start <= i {
+					out = append(out, strings.TrimSpace(raw[start:i]))
+					start = -1
+				}
+			}
+		}
 	}
 	return out
 }
@@ -1260,28 +1459,42 @@ func parseSQLColumns(raw string) []string {
 func splitSQLValues(raw string) []string {
 	out := []string{}
 	var b strings.Builder
-	inQuote := false
+	inSingle := false
+	inDouble := false
+	depth := 0
 	for i := 0; i < len(raw); i++ {
 		ch := raw[i]
-		if ch == '\'' {
-			if inQuote && i+1 < len(raw) && raw[i+1] == '\'' {
+		if ch == '\'' && !inDouble {
+			if inSingle && i+1 < len(raw) && raw[i+1] == '\'' {
 				b.WriteByte('\'')
 				i++
 				continue
 			}
-			inQuote = !inQuote
+			inSingle = !inSingle
 			b.WriteByte(ch)
 			continue
 		}
-		if ch == ',' && !inQuote {
-			out = append(out, strings.TrimSpace(b.String()))
-			b.Reset()
+		if ch == '"' && !inSingle {
+			inDouble = !inDouble
+			b.WriteByte(ch)
 			continue
+		}
+		if !inSingle && !inDouble {
+			if ch == '(' {
+				depth++
+			} else if ch == ')' && depth > 0 {
+				depth--
+			}
+			if ch == ',' && depth == 0 {
+				out = append(out, strings.TrimSpace(b.String()))
+				b.Reset()
+				continue
+			}
 		}
 		b.WriteByte(ch)
 	}
-	if b.Len() > 0 {
-		out = append(out, strings.TrimSpace(b.String()))
+	if s := strings.TrimSpace(b.String()); s != "" {
+		out = append(out, s)
 	}
 	return out
 }
@@ -1295,6 +1508,9 @@ func unquoteSQLValue(v string) string {
 		v = v[1 : len(v)-1]
 		v = strings.ReplaceAll(v, `''`, `'`)
 		return v
+	}
+	if len(v) >= 2 && v[0] == '"' && v[len(v)-1] == '"' {
+		return strings.TrimSpace(v[1 : len(v)-1])
 	}
 	return v
 }
@@ -1531,6 +1747,15 @@ func trimForAudit(s string) string {
 	return s
 }
 
+func parseLoginAuditQuery(r *http.Request) LoginAuditQuery {
+	return LoginAuditQuery{
+		Limit:  parseIntRange(r.URL.Query().Get("limit"), 50, 1, 200),
+		Offset: parseIntRange(r.URL.Query().Get("offset"), 0, 0, 1_000_000),
+		From:   parseDatePrefixRFC3339(strings.TrimSpace(r.URL.Query().Get("from")), false),
+		To:     parseDatePrefixRFC3339(strings.TrimSpace(r.URL.Query().Get("to")), true),
+	}
+}
+
 func parseOpAuditQuery(r *http.Request) OpAuditQuery {
 	q := OpAuditQuery{
 		Limit:  parseIntRange(r.URL.Query().Get("limit"), 50, 1, 200),
@@ -1677,6 +1902,7 @@ const indexHTML = `<!doctype html>
     <div class="actions">
       <button onclick="previewImportCCSwitch()">CC预检（dry-run）</button>
       <button onclick="importCCSwitch()">CC导入</button>
+      <button class="ghost" onclick="downloadCCSwitchMappingReport()">下载CC映射报告(CSV)</button>
     </div>
   </div>
 
@@ -1688,7 +1914,19 @@ const indexHTML = `<!doctype html>
 
   <div class="card">
     <h3>登录审计</h3>
+    <div class="row">
+      <div>
+        <label>开始日期（from）</label>
+        <input id="auditFromFilter" type="date"/>
+      </div>
+      <div>
+        <label>结束日期（to）</label>
+        <input id="auditToFilter" type="date"/>
+      </div>
+    </div>
     <div class="actions">
+      <button onclick="applyAuditFilter()">应用过滤</button>
+      <button class="ghost" onclick="clearAuditFilter()">清空过滤</button>
       <button onclick="prevAuditPage()">上一页</button>
       <button onclick="nextAuditPage()">下一页</button>
       <button class="ghost" onclick="loadAudits()">刷新审计日志</button>
@@ -1762,6 +2000,8 @@ let opActionFilter = '';
 let opTargetFilter = '';
 let opFromFilter = '';
 let opToFilter = '';
+let auditFromFilter = '';
+let auditToFilter = '';
 
 function H(){ return {'Content-Type':'application/json'}; }
 async function api(url,opt={}){ const r=await fetch(url,{...opt,credentials:'same-origin',headers:{...(opt.headers||{}),...H()}}); if(!r.ok) throw new Error(await r.text()); return r.json(); }
@@ -1935,6 +2175,30 @@ async function importCCSwitch(){
   await loadOpAudits();
 }
 
+async function downloadCCSwitchMappingReport(){
+  const sql = (document.getElementById('ccSwitchSql').value || '').trim();
+  if(!sql){ alert('请先粘贴 CC-Switch SQLite 导出 SQL'); return; }
+  const r = await fetch('/api/providers/import-cc/report',{
+    method:'POST',
+    credentials:'same-origin',
+    headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({sql})
+  });
+  if(!r.ok){ alert(await r.text()); return; }
+  const blob = await r.blob();
+  const cd = r.headers.get('Content-Disposition') || '';
+  const m = cd.match(/filename=([^;]+)/i);
+  const filename = (m && m[1] ? m[1].replace(/"/g,'') : ('cc-switch-mapping-report-'+Date.now()+'.csv'));
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = filename;
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  URL.revokeObjectURL(url);
+}
+
 function exportProviders(){
   const q='search='+encodeURIComponent(providerSearch)+'&target='+encodeURIComponent(providerTargetFilter);
   window.open('/api/providers/export?'+q,'_blank');
@@ -2040,14 +2304,18 @@ async function rollback(name){
 }
 
 async function loadAudits(){
-  const res=await api('/api/login-audits?limit='+auditLimit+'&offset='+auditOffset);
+  const q='limit='+auditLimit+'&offset='+auditOffset+'&from='+encodeURIComponent(auditFromFilter)+'&to='+encodeURIComponent(auditToFilter);
+  const res=await api('/api/login-audits?'+q);
   const list=res.items||[];
   auditTotal = res.total||0;
   const tb=document.getElementById('audits'); tb.innerHTML='';
   const pager=document.getElementById('auditPager');
   const from = auditTotal===0 ? 0 : (auditOffset+1);
   const to = Math.min(auditOffset+auditLimit, auditTotal);
-  pager.textContent='审计日志：共 '+auditTotal+' 条，当前 '+from+' - '+to;
+  const f = [];
+  if(auditFromFilter) f.push('from='+auditFromFilter);
+  if(auditToFilter) f.push('to='+auditToFilter);
+  pager.textContent='审计日志：共 '+auditTotal+' 条，当前 '+from+' - '+to + (f.length?('，过滤：'+f.join(', ')): '');
   list.forEach(a=>{
     const tr=document.createElement('tr');
     const ua=(a.userAgent||'').replace(/</g,'&lt;').replace(/>/g,'&gt;');
@@ -2067,8 +2335,25 @@ function nextAuditPage(){
   loadAudits();
 }
 
+function applyAuditFilter(){
+  auditFromFilter = (document.getElementById('auditFromFilter').value || '').trim();
+  auditToFilter = (document.getElementById('auditToFilter').value || '').trim();
+  auditOffset = 0;
+  loadAudits();
+}
+
+function clearAuditFilter(){
+  auditFromFilter = '';
+  auditToFilter = '';
+  document.getElementById('auditFromFilter').value = '';
+  document.getElementById('auditToFilter').value = '';
+  auditOffset = 0;
+  loadAudits();
+}
+
 function exportAudits(){
-  window.open('/api/login-audits/export?limit=2000','_blank');
+  const q='limit=2000&from='+encodeURIComponent(auditFromFilter)+'&to='+encodeURIComponent(auditToFilter);
+  window.open('/api/login-audits/export?'+q,'_blank');
 }
 
 async function loadOpAudits(){

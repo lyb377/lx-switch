@@ -78,7 +78,7 @@ Body:
 
 ### POST /api/providers/import-cc
 
-导入 CC-Switch SQLite SQL dump（第一版兼容）。
+导入 CC-Switch SQLite SQL dump（增强版兼容）。
 
 Body:
 ```json
@@ -90,7 +90,25 @@ Body:
 }
 ```
 
-说明：解析 `INSERT INTO "providers" ...`，映射 `app_type -> target`，从 `settings_config` 提取 `baseUrl/apiKey/model`。
+说明：
+- 解析 `INSERT INTO providers ... VALUES (...),(...);` 多行语句（兼容 `"providers"`/`` `providers` ``/`[providers]` 写法）
+- 映射 `app_type -> target`
+- 从 `settings_config` 提取 `baseUrl/apiKey/model`
+- 返回 `mappingReport`（逐行映射结果与跳过原因）
+
+### POST /api/providers/import-cc/report
+
+生成并下载 CC-Switch 导入映射报告（CSV）。
+
+Body:
+```json
+{
+  "sql": "-- sqlite dump text ..."
+}
+```
+
+Response:
+- `text/csv` 附件下载，包含逐行映射状态与 summary。
 
 ### POST /api/providers/test
 
@@ -146,10 +164,8 @@ Body:
 Query:
 - `limit` (default 50)
 - `offset` (default 0)
-- `from` (optional, 计划支持：`YYYY-MM-DD` 或 RFC3339)
-- `to` (optional, 计划支持：`YYYY-MM-DD` 或 RFC3339)
-
-> 说明：`from/to` 当前处于 M3 收尾阶段，若服务版本未包含该能力则会忽略该参数或返回参数错误。
+- `from` (optional, `YYYY-MM-DD` 或 RFC3339)
+- `to` (optional, `YYYY-MM-DD` 或 RFC3339)
 
 ### GET /api/login-audits/export
 
@@ -157,8 +173,8 @@ Query:
 
 Query:
 - `limit` (default 2000)
-- `from` (optional, 计划支持)
-- `to` (optional, 计划支持)
+- `from` (optional, `YYYY-MM-DD` 或 RFC3339)
+- `to` (optional, `YYYY-MM-DD` 或 RFC3339)
 
 ### GET /api/op-audits
 
