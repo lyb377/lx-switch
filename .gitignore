@@ -1,13 +1,22 @@
-# Build outputs
-/lx-switch
-/lx-switch.bak.*
+# Secrets / local configs
+**/config.local.json
 
-# Runtime data
-/data/
-*.db
-*.sqlite
+# Dependencies / caches
+node_modules/
+.openclaw/
 
-# OS/editor
-.DS_Store
-.vscode/
-.idea/
+# Large/generated artifacts
+tmp/
+memory/
+*.png
+*.xlsx
+*.csv
+*.json
+
+# External skill repos or embedded repos
+openclaw-dae-skills/
+freemail/
+
+# Built binaries
+lx-switch/lx-switch
+lx-switch/*.bak*

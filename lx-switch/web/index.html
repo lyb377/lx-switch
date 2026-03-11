@@ -1,0 +1,181 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8"/>
+  <meta name="viewport" content="width=device-width, initial-scale=1"/>
+  <title>LX Switch</title>
+  <link rel="stylesheet" href="/static/app.css"/>
+</head>
+<body>
+  <h2>LX Switch v0.2</h2>
+  <p class="muted">Server-native switch panel for Claude/Codex/OpenClaw/Gemini</p>
+
+  <div id="firstRun" class="ok hide"></div>
+  <div id="weakToken" class="warn hide"></div>
+  <div id="activeProvider" class="ok hide"></div>
+  <div id="auditRetention" class="muted"></div>
+
+  <div class="card">
+    <div style="display:flex;justify-content:space-between;align-items:center;gap:10px;">
+      <div class="muted">已登录，可直接管理 Provider</div>
+      <button style="width:auto" onclick="location.href='/logout'">退出登录</button>
+    </div>
+  </div>
+
+  <div class="card">
+    <h3 id="editorTitle">新增 Provider</h3>
+    <div class="row">
+      <div><label>Name</label><input id="name"/></div>
+      <div><label>Target</label>
+        <select id="target">
+          <option>openclaw</option><option>claude</option><option>codex</option><option>gemini</option>
+        </select>
+      </div>
+    </div>
+    <div class="row">
+      <div><label>Base URL</label><input id="baseUrl"/></div>
+      <div><label>Model</label><input id="model"/></div>
+    </div>
+    <label>API Key</label><input id="apiKey"/>
+    <label>Notes</label><textarea id="notes"></textarea>
+    <div class="actions">
+      <button onclick="saveProvider()">保存</button>
+      <button class="ghost" id="cancelEditBtn" onclick="cancelEdit()" style="display:none">取消编辑</button>
+    </div>
+  </div>
+
+  <div class="card">
+    <h3>Providers</h3>
+    <div class="row">
+      <div>
+        <label>搜索</label>
+        <input id="providerSearch" placeholder="name/model/baseUrl/notes"/>
+      </div>
+      <div>
+        <label>Target 过滤</label>
+        <select id="providerTargetFilter">
+          <option value="">全部</option>
+          <option>openclaw</option><option>claude</option><option>codex</option><option>gemini</option>
+        </select>
+      </div>
+    </div>
+    <div class="actions">
+      <button onclick="applyProviderFilter()">应用过滤</button>
+      <button class="ghost" onclick="clearProviderFilter()">清空过滤</button>
+      <button class="ghost" onclick="testProvidersBatch()">批量测试当前筛选</button>
+      <button class="ghost" onclick="exportLastBatchTestCsv()">导出最近批测(CSV)</button>
+      <button class="ghost" onclick="exportLastBatchTestJson()">导出最近批测(JSON)</button>
+    </div>
+    <table><thead><tr><th>ID</th><th>Name</th><th>Target</th><th>Model</th><th>操作</th></tr></thead><tbody id="rows"></tbody></table>
+  </div>
+
+  <div class="card">
+    <h3>批量导入 Providers(JSON / CC-Switch SQL)</h3>
+    <p class="muted">JSON格式：{"items":[{"name":"...","target":"openclaw","baseUrl":"https://...","apiKey":"...","model":"...","notes":"..."}]}</p>
+    <div class="row">
+      <div>
+        <label>冲突策略</label>
+        <select id="importMode"><option value="skip">skip（冲突跳过）</option><option value="overwrite">overwrite（冲突覆盖）</option></select>
+      </div>
+      <div>
+        <label>预检明细上限</label>
+        <input id="previewLimit" type="number" min="1" max="200" value="30"/>
+      </div>
+    </div>
+    <label>导入 JSON</label>
+    <textarea id="importJson" rows="5" placeholder='{"items":[{"name":"demo","target":"openclaw","baseUrl":"https://cli.lyb123.top/v1","model":"gpt-5.3-codex"}]}'></textarea>
+    <div class="actions">
+      <button onclick="previewImportProviders()">JSON预检（dry-run）</button>
+      <button onclick="importProviders()">JSON导入</button>
+      <button class="ghost" onclick="exportProviders()">导出当前筛选 JSON</button>
+      <button class="ghost" onclick="exportLastImportJson()">导出最近导入结果(JSON)</button>
+      <button class="ghost" onclick="exportLastImportCsv()">导出最近导入结果(CSV)</button>
+    </div>
+    <label>导入 CC-Switch SQLite 导出 SQL（粘贴文本）</label>
+    <textarea id="ccSwitchSql" rows="5" placeholder="-- CC Switch SQLite 导出...\nINSERT INTO \"providers\" ..."></textarea>
+    <div class="actions">
+      <button onclick="previewImportCCSwitch()">CC预检（dry-run）</button>
+      <button onclick="importCCSwitch()">CC导入</button>
+      <button class="ghost" onclick="downloadCCSwitchMappingReport()">下载CC映射报告(CSV)</button>
+    </div>
+  </div>
+
+  <div class="card">
+    <h3>Backups</h3>
+    <button onclick="loadBackups()">刷新备份</button>
+    <table><thead><tr><th>Name</th><th>Size</th><th>操作</th></tr></thead><tbody id="backs"></tbody></table>
+  </div>
+
+  <div class="card">
+    <h3>登录审计</h3>
+    <div class="row">
+      <div>
+        <label>开始日期（from）</label>
+        <input id="auditFromFilter" type="date"/>
+      </div>
+      <div>
+        <label>结束日期（to）</label>
+        <input id="auditToFilter" type="date"/>
+      </div>
+    </div>
+    <div class="actions">
+      <button onclick="applyAuditFilter()">应用过滤</button>
+      <button class="ghost" onclick="clearAuditFilter()">清空过滤</button>
+      <button onclick="prevAuditPage()">上一页</button>
+      <button onclick="nextAuditPage()">下一页</button>
+      <button class="ghost" onclick="loadAudits()">刷新审计日志</button>
+      <button class="ghost" onclick="exportAudits()">导出 CSV</button>
+    </div>
+    <div id="auditPager" class="muted"></div>
+    <table><thead><tr><th>时间</th><th>IP</th><th>结果</th><th>原因</th><th>UA</th></tr></thead><tbody id="audits"></tbody></table>
+  </div>
+
+  <div class="card">
+    <h3>操作审计</h3>
+    <div class="row">
+      <div>
+        <label>默认保留天数</label>
+        <input id="auditKeepDays" type="number" min="1" max="3650" value="30"/>
+      </div>
+      <div>
+        <label><input id="auditAutoEnabled" type="checkbox" checked style="width:auto;margin-right:8px"/>启用自动每日清理</label>
+      </div>
+    </div>
+    <div class="actions">
+      <button onclick="saveAuditSettings()">保存审计设置</button>
+      <button onclick="prevOpPage()">上一页</button>
+      <button onclick="nextOpPage()">下一页</button>
+      <button class="ghost" onclick="loadOpAudits()">刷新操作日志</button>
+      <button class="ghost" onclick="exportOpAudits()">导出 CSV</button>
+      <button class="ghost" onclick="cleanupAudits()">清理旧审计</button>
+    </div>
+    <div class="row">
+      <div>
+        <label>Action 过滤</label>
+        <input id="opActionFilter" placeholder="例如 provider.activate"/>
+      </div>
+      <div>
+        <label>Target 过滤</label>
+        <input id="opTargetFilter" placeholder="例如 openclaw"/>
+      </div>
+    </div>
+    <div class="row">
+      <div>
+        <label>开始日期（from）</label>
+        <input id="opFromFilter" type="date"/>
+      </div>
+      <div>
+        <label>结束日期（to）</label>
+        <input id="opToFilter" type="date"/>
+      </div>
+    </div>
+    <div class="actions">
+      <button onclick="applyOpFilter()">应用过滤</button>
+      <button class="ghost" onclick="clearOpFilter()">清空过滤</button>
+    </div>
+    <div id="opPager" class="muted"></div>
+    <table><thead><tr><th>时间</th><th>Action</th><th>Target</th><th>Detail</th><th>IP</th><th>UA</th></tr></thead><tbody id="ops"></tbody></table>
+  </div>
+
+<script src="/static/app.js"></script>
+</body></html>

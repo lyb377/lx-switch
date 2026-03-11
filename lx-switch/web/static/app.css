@@ -1,0 +1,11 @@
+body{font-family:system-ui,-apple-system,Segoe UI,Roboto,sans-serif;margin:20px;max-width:980px}
+    input,select,textarea,button{padding:8px;margin:4px 0;width:100%}
+    .row{display:grid;grid-template-columns:1fr 1fr;gap:10px}
+    .card{border:1px solid #ddd;border-radius:10px;padding:12px;margin:10px 0}
+    .muted{color:#666;font-size:12px}
+    table{width:100%;border-collapse:collapse} td,th{border-bottom:1px solid #eee;padding:8px;text-align:left}
+    .actions button{width:auto;margin-right:6px}
+    .actions .ghost{background:#f3f4f6}
+    .warn{background:#fff7ed;border:1px solid #fdba74;color:#9a3412;padding:10px;border-radius:8px;margin:10px 0}
+    .ok{background:#ecfeff;border:1px solid #67e8f9;color:#155e75;padding:10px;border-radius:8px;margin:10px 0}
+    .hide{display:none}
