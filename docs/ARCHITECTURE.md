@@ -23,10 +23,10 @@
 5. **存储层**
    - SQLite 初始化/迁移（`initDB`）
    - 事务写入（导入/覆盖场景）
-6. **前端层（当前为内嵌 HTML/JS）**
-   - Provider 列表管理
-   - 批导入/导出
-   - 审计查看与过滤
+6. **前端层（静态文件托管，待组件化）**
+   - `lx-switch/web/index.html` / `lx-switch/web/login.html`
+   - `lx-switch/web/static/*`（app.js/app.css/login.css 等）
+   - Provider 列表管理、导入导出、审计查看与过滤
 
 ## 2. 近期重构进展
 
