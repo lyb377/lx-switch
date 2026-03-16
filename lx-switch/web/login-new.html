@@ -1,0 +1,20 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>LX Switch Login</title>
+  <link rel="stylesheet" href="/src/styles/login.css" />
+</head>
+<body>
+  <div class="wrap">
+    <h3>LX Switch 登录</h3>
+    <p class="muted">输入管理员 Token 进入面板</p>
+    <!-- ERROR_BLOCK -->
+    <form method="post" action="/login">
+      <input type="password" name="token" placeholder="Admin Token" required />
+      <button type="submit">登录</button>
+    </form>
+  </div>
+</body>
+</html>
