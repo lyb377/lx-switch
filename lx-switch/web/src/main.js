@@ -7,7 +7,7 @@ import { api } from './apiClient/index.js';
 import { showToast } from './apiClient/toast.js';
 import { metaState } from './state/index.js';
 import { Alert } from './components/index.js';
-import { renderProviderPage, renderImportPage, renderAuditPage } from './pages/index.js';
+import { renderProviderPage, renderImportPage, renderAuditPage, renderDashboardPage } from './pages/index.js';
 
 // 目标选项
 const TARGET_OPTIONS = ['openclaw', 'claude', 'codex', 'gemini'];
@@ -53,6 +53,7 @@ function renderTabs(container) {
   tabs.className = 'tabs';
 
   const tabBtns = [
+    { id: 'dashboard', label: 'Dashboard' },
     { id: 'providers', label: 'Provider 管理' },
     { id: 'import', label: '导入导出' },
     { id: 'audit', label: '审计日志' },
@@ -60,7 +61,7 @@ function renderTabs(container) {
 
   tabBtns.forEach(tab => {
     const btn = document.createElement('button');
-    btn.className = `tab-btn ${tab.id === 'providers' ? 'active' : ''}`;
+    btn.className = `tab-btn ${tab.id === 'dashboard' ? 'active' : ''}`;
     btn.textContent = tab.label;
     btn.dataset.tab = tab.id;
     btn.onclick = () => switchTab(tab.id);
@@ -91,6 +92,9 @@ function switchTab(tabId) {
   content.innerHTML = '';
 
   switch (tabId) {
+    case 'dashboard':
+      renderDashboardPage(content);
+      break;
     case 'providers':
       renderProviderPage(content);
       break;
@@ -162,8 +166,8 @@ async function init() {
   // 加载元数据
   await loadMeta();
 
-  // 默认显示 Provider 页面
-  renderProviderPage(tabContent);
+  // 默认显示 Dashboard 页面
+  renderDashboardPage(tabContent);
 
   // 监听刷新事件
   window.addEventListener('providers:refresh', async () => {

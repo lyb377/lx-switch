@@ -27,6 +27,8 @@ type App struct {
 	dataDir             string
 	backupDir           string
 	adminToken          string
+	ipAllowlistEnabled  bool
+	trustedProxies      []string
 	failed              map[string]*attemptState
 	mu                  sync.Mutex
 	settingsMu          sync.RWMutex
@@ -154,6 +156,27 @@ type ProviderTestResult struct {
 	Detail     string `json:"detail"`
 }
 
+type MetricsSummary struct {
+	Window     string                 `json:"window"`
+	Login      LoginMetrics           `json:"login"`
+	Operations map[string]OpMetrics   `json:"operations"`
+	ByTarget   map[string]int         `json:"byTarget"`
+}
+
+type LoginMetrics struct {
+	Total       int     `json:"total"`
+	Success     int     `json:"success"`
+	Failed      int     `json:"failed"`
+	SuccessRate float64 `json:"successRate"`
+	UniqueIPs   int     `json:"uniqueIPs"`
+}
+
+type OpMetrics struct {
+	Total       int     `json:"total"`
+	Failed      int     `json:"failed"`
+	FailureRate float64 `json:"failureRate"`
+}
+
 func main() {
 	app, listen, err := newAppFromEnv()
 	if err != nil {
@@ -175,6 +198,8 @@ func newAppFromEnv() (*App, string, error) {
 	if strings.TrimSpace(token) == "" {
 		token = "change-me-please"
 	}
+	ipAllowlistEnabled := getenvBool("LX_SWITCH_IP_ALLOWLIST_ENABLED", false)
+	trustedProxies := parseCommaList(os.Getenv("LX_SWITCH_TRUSTED_PROXIES"))
 
 	if err := os.MkdirAll(dataDir, 0o755); err != nil {
 		return nil, "", err
@@ -195,6 +220,8 @@ func newAppFromEnv() (*App, string, error) {
 		dataDir:             dataDir,
 		backupDir:           backupDir,
 		adminToken:          token,
+		ipAllowlistEnabled:  ipAllowlistEnabled,
+		trustedProxies:      trustedProxies,
 		failed:              map[string]*attemptState{},
 		maxAttempts:         getenvInt("LX_SWITCH_MAX_LOGIN_ATTEMPTS", 6),
 		window:              time.Duration(getenvInt("LX_SWITCH_LOGIN_WINDOW_SEC", 300)) * time.Second,
@@ -206,37 +233,60 @@ func newAppFromEnv() (*App, string, error) {
 	if err := app.initDB(); err != nil {
 		return nil, "", err
 	}
+	if err := app.initRBACSchema(); err != nil {
+		return nil, "", err
+	}
+	app.loadSecuritySettings()
 	if app.auditCleanupEnabled {
 		go app.startAuditCleanupLoop()
 	}
+	go app.startSessionCleanupLoop()
 	return app, listen, nil
 }
 
 func (a *App) newMux() *http.ServeMux {
 	mux := http.NewServeMux()
 	mux.Handle("/static/", http.StripPrefix("/static/", http.FileServer(http.Dir("web/static"))))
-	mux.HandleFunc("/", a.withPageAuth(a.handleIndex))
-	mux.HandleFunc("/login", a.handleLogin)
-	mux.HandleFunc("/logout", a.withPageAuth(a.handleLogout))
+	mux.HandleFunc("/", a.withIPAllowlist(a.withPageAuth(a.handleIndex)))
+	mux.HandleFunc("/login", a.withIPAllowlist(a.handleLogin))
+	mux.HandleFunc("/logout", a.withIPAllowlist(a.withPageAuth(a.handleLogout)))
 	mux.HandleFunc("/healthz", a.handleHealth)
-	mux.HandleFunc("/api/providers", a.withAuth(a.handleProviders))
-	mux.HandleFunc("/api/providers/import", a.withAuth(a.handleProvidersImport))
-	mux.HandleFunc("/api/providers/import-cc", a.withAuth(a.handleProvidersImportCCSwitch))
-	mux.HandleFunc("/api/providers/import-cc/report", a.withAuth(a.handleProvidersImportCCSwitchReport))
-	mux.HandleFunc("/api/providers/export", a.withAuth(a.handleProvidersExport))
-	mux.HandleFunc("/api/providers/test", a.withAuth(a.handleProviderTest))
-	mux.HandleFunc("/api/providers/test-batch", a.withAuth(a.handleProviderTestBatch))
-	mux.HandleFunc("/api/providers/", a.withAuth(a.handleProviderByID))
-	mux.HandleFunc("/api/activate", a.withAuth(a.handleActivate))
-	mux.HandleFunc("/api/backups", a.withAuth(a.handleBackups))
-	mux.HandleFunc("/api/rollback", a.withAuth(a.handleRollback))
-	mux.HandleFunc("/api/meta", a.withAuth(a.handleMeta))
-	mux.HandleFunc("/api/login-audits", a.withAuth(a.handleLoginAudits))
-	mux.HandleFunc("/api/login-audits/export", a.withAuth(a.handleLoginAuditsExport))
-	mux.HandleFunc("/api/op-audits", a.withAuth(a.handleOpAudits))
-	mux.HandleFunc("/api/op-audits/export", a.withAuth(a.handleOpAuditsExport))
-	mux.HandleFunc("/api/audits/cleanup", a.withAuth(a.handleAuditsCleanup))
-	mux.HandleFunc("/api/audits/settings", a.withAuth(a.handleAuditSettings))
+	mux.HandleFunc("/api/providers", a.withIPAllowlist(a.withAuth(a.handleProviders)))
+	mux.HandleFunc("/api/providers/import", a.withIPAllowlist(a.withAuth(a.handleProvidersImport)))
+	mux.HandleFunc("/api/providers/import-cc", a.withIPAllowlist(a.withAuth(a.handleProvidersImportCCSwitch)))
+	mux.HandleFunc("/api/providers/import-cc/report", a.withIPAllowlist(a.withAuth(a.handleProvidersImportCCSwitchReport)))
+	mux.HandleFunc("/api/providers/export", a.withIPAllowlist(a.withAuth(a.handleProvidersExport)))
+	mux.HandleFunc("/api/providers/test", a.withIPAllowlist(a.withAuth(a.handleProviderTest)))
+	mux.HandleFunc("/api/providers/test-batch", a.withIPAllowlist(a.withAuth(a.handleProviderTestBatch)))
+	mux.HandleFunc("/api/providers/", a.withIPAllowlist(a.withAuth(a.handleProviderByID)))
+	mux.HandleFunc("/api/activate", a.withIPAllowlist(a.withAuth(a.handleActivate)))
+	mux.HandleFunc("/api/backups", a.withIPAllowlist(a.withAuth(a.handleBackups)))
+	mux.HandleFunc("/api/rollback", a.withIPAllowlist(a.withAuth(a.handleRollback)))
+	mux.HandleFunc("/api/meta", a.withIPAllowlist(a.withAuth(a.handleMeta)))
+	mux.HandleFunc("/api/login-audits", a.withIPAllowlist(a.withAuth(a.handleLoginAudits)))
+	mux.HandleFunc("/api/login-audits/export", a.withIPAllowlist(a.withAuth(a.handleLoginAuditsExport)))
+	mux.HandleFunc("/api/op-audits", a.withIPAllowlist(a.withAuth(a.handleOpAudits)))
+	mux.HandleFunc("/api/op-audits/export", a.withIPAllowlist(a.withAuth(a.handleOpAuditsExport)))
+	mux.HandleFunc("/api/audits/cleanup", a.withIPAllowlist(a.withAuth(a.handleAuditsCleanup)))
+	mux.HandleFunc("/api/audits/settings", a.withIPAllowlist(a.withAuth(a.handleAuditSettings)))
+	mux.HandleFunc("/api/metrics/dashboard", a.withIPAllowlist(a.withAuth(a.handleMetricsDashboard)))
+	mux.HandleFunc("/api/metrics/export", a.withIPAllowlist(a.withAuth(a.handleMetricsExport)))
+	mux.HandleFunc("/api/security/ip-allowlist", a.withIPAllowlist(a.withAuth(a.handleIPAllowlist)))
+	mux.HandleFunc("/api/security/ip-allowlist/", a.withIPAllowlist(a.withAuth(a.handleIPAllowlistByID)))
+	mux.HandleFunc("/api/security/settings", a.withIPAllowlist(a.withAuth(a.handleSecuritySettings)))
+
+	// RBAC API routes
+	mux.HandleFunc("/api/auth/login", a.withIPAllowlist(a.handleUserLogin))
+	mux.HandleFunc("/api/auth/logout", a.withIPAllowlist(a.handleUserLogout))
+	mux.HandleFunc("/api/users", a.withIPAllowlist(a.withRBACAuth(PermUsersRead, a.handleListUsers)))
+	mux.HandleFunc("/api/users/create", a.withIPAllowlist(a.withRBACAuth(PermUsersWrite, a.handleCreateUser)))
+	mux.HandleFunc("/api/users/update", a.withIPAllowlist(a.withRBACAuth(PermUsersWrite, a.handleUpdateUser)))
+	mux.HandleFunc("/api/users/delete", a.withIPAllowlist(a.withRBACAuth(PermUsersWrite, a.handleDeleteUser)))
+	mux.HandleFunc("/api/roles", a.withIPAllowlist(a.withRBACAuth(PermUsersRead, a.handleListRoles)))
+	mux.HandleFunc("/api/totp/enable", a.withIPAllowlist(a.handleEnableTOTP))
+	mux.HandleFunc("/api/totp/confirm", a.withIPAllowlist(a.handleConfirmTOTP))
+	mux.HandleFunc("/api/totp/disable", a.withIPAllowlist(a.handleDisableTOTP))
+
 	return mux
 }
 
@@ -274,9 +324,36 @@ CREATE TABLE IF NOT EXISTS op_audits (
   user_agent TEXT,
   created_at TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS ip_allowlist (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  ip_cidr TEXT NOT NULL,
+  description TEXT,
+  enabled INTEGER NOT NULL DEFAULT 1,
+  created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_ip_allowlist_enabled ON ip_allowlist(enabled);
 `
 	_, err := a.db.Exec(schema)
 	return err
+}
+
+func parseCommaList(raw string) []string {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return nil
+	}
+	parts := strings.Split(raw, ",")
+	out := make([]string, 0, len(parts))
+	for _, p := range parts {
+		s := strings.TrimSpace(p)
+		if s != "" {
+			out = append(out, s)
+		}
+	}
+	if out == nil {
+		out = []string{}
+	}
+	return out
 }
 
 func (a *App) handleIndex(w http.ResponseWriter, r *http.Request) {
@@ -638,6 +715,39 @@ func (a *App) handleAuditSettings(w http.ResponseWriter, r *http.Request) {
 	default:
 		w.WriteHeader(http.StatusMethodNotAllowed)
 	}
+}
+
+func (a *App) handleMetricsSummary(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		w.WriteHeader(http.StatusMethodNotAllowed)
+		return
+	}
+
+	window := strings.TrimSpace(r.URL.Query().Get("window"))
+	if window == "" {
+		window = "24h"
+	}
+
+	var duration string
+	switch window {
+	case "24h":
+		duration = "-1 day"
+	case "7d":
+		duration = "-7 days"
+	case "30d":
+		duration = "-30 days"
+	default:
+		http.Error(w, "invalid window, must be 24h|7d|30d", 400)
+		return
+	}
+
+	summary, err := a.getMetricsSummary(duration, window)
+	if err != nil {
+		http.Error(w, err.Error(), 500)
+		return
+	}
+
+	_ = json.NewEncoder(w).Encode(summary)
 }
 
 func (a *App) handleProviders(w http.ResponseWriter, r *http.Request) {
@@ -1176,6 +1286,103 @@ func (a *App) listOpAudits(q OpAuditQuery) ([]OpAudit, error) {
 		out = []OpAudit{}
 	}
 	return out, nil
+}
+
+func (a *App) getMetricsSummary(duration, window string) (*MetricsSummary, error) {
+	// Login metrics
+	loginQuery := `
+		SELECT
+			COUNT(*) as total,
+			SUM(CASE WHEN success = 1 THEN 1 ELSE 0 END) as success,
+			COUNT(DISTINCT ip) as unique_ips
+		FROM login_audits
+		WHERE created_at >= datetime('now', ?)
+	`
+	var loginTotal, loginSuccess, uniqueIPs int
+	err := a.db.QueryRow(loginQuery, duration).Scan(&loginTotal, &loginSuccess, &uniqueIPs)
+	if err != nil {
+		return nil, err
+	}
+
+	loginFailed := loginTotal - loginSuccess
+	var successRate float64
+	if loginTotal > 0 {
+		successRate = float64(loginSuccess) / float64(loginTotal) * 100
+	}
+
+	// Operation metrics by action
+	opQuery := `
+		SELECT
+			action,
+			COUNT(*) as total,
+			SUM(CASE WHEN detail LIKE '%失败%' OR detail LIKE '%error%' OR detail LIKE '%failed%' THEN 1 ELSE 0 END) as failed
+		FROM op_audits
+		WHERE created_at >= datetime('now', ?)
+		GROUP BY action
+	`
+	rows, err := a.db.Query(opQuery, duration)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	operations := make(map[string]OpMetrics)
+	for rows.Next() {
+		var action string
+		var total, failed int
+		if err := rows.Scan(&action, &total, &failed); err != nil {
+			return nil, err
+		}
+		var failureRate float64
+		if total > 0 {
+			failureRate = float64(failed) / float64(total) * 100
+		}
+		operations[action] = OpMetrics{
+			Total:       total,
+			Failed:      failed,
+			FailureRate: failureRate,
+		}
+	}
+
+	// By target (activate actions only)
+	targetQuery := `
+		SELECT
+			target,
+			COUNT(*) as count
+		FROM op_audits
+		WHERE created_at >= datetime('now', ?)
+			AND action = 'activate'
+			AND target IN ('openclaw', 'claude', 'codex', 'gemini')
+		GROUP BY target
+	`
+	targetRows, err := a.db.Query(targetQuery, duration)
+	if err != nil {
+		return nil, err
+	}
+	defer targetRows.Close()
+
+	byTarget := make(map[string]int)
+	for targetRows.Next() {
+		var target string
+		var count int
+		if err := targetRows.Scan(&target, &count); err != nil {
+			return nil, err
+		}
+		byTarget[target] = count
+	}
+
+	return &MetricsSummary{
+		Window: window,
+		Login: LoginMetrics{
+			Total:       loginTotal,
+			Success:     loginSuccess,
+			Failed:      loginFailed,
+			SuccessRate: successRate,
+			UniqueIPs:   uniqueIPs,
+		},
+		Operations: operations,
+		ByTarget:   byTarget,
+	}, nil
 }
 
 func (a *App) listProviders(q ProviderQuery) ([]Provider, error) {
