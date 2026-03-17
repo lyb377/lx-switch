@@ -23,7 +23,8 @@ type IPAllowlistEntry struct {
 
 // SecuritySettings holds security-related settings
 type SecuritySettings struct {
-	IPAllowlistEnabled bool `json:"ipAllowlistEnabled"`
+	IPAllowlistEnabled bool     `json:"ipAllowlistEnabled"`
+	TrustedProxies     []string `json:"trustedProxies"`
 }
 
 // ipAllowlistCache caches the allowlist in memory
@@ -36,6 +37,20 @@ var allowlistCache ipAllowlistCache
 
 // loadSecuritySettings loads security settings and IP allowlist into memory
 func (a *App) loadSecuritySettings() {
+	// Load IP allowlist enabled status from database
+	if v, err := a.getState("ip_allowlist_enabled"); err == nil && v != "" {
+		a.ipAllowlistEnabled = v == "1" || v == "true"
+	}
+
+	// Load trusted proxies from database
+	if v, err := a.getState("trusted_proxies"); err == nil && v != "" {
+		var proxies []string
+		if err := json.Unmarshal([]byte(v), &proxies); err == nil {
+			a.trustedProxies = proxies
+		}
+	}
+
+	// Load IP allowlist entries
 	entries, err := a.listIPAllowlist()
 	if err != nil {
 		entries = []IPAllowlistEntry{}
@@ -43,6 +58,71 @@ func (a *App) loadSecuritySettings() {
 	allowlistCache.mu.Lock()
 	allowlistCache.entries = entries
 	allowlistCache.mu.Unlock()
+}
+
+// getRealIP gets the real client IP, supporting X-Forwarded-For trust chain
+func getRealIP(r *http.Request, trustedProxies []string) string {
+	remoteIP, _, err := net.SplitHostPort(strings.TrimSpace(r.RemoteAddr))
+	if err != nil {
+		remoteIP = strings.TrimSpace(r.RemoteAddr)
+	}
+
+	remoteNetIP := net.ParseIP(remoteIP)
+	if remoteNetIP == nil {
+		return remoteIP
+	}
+
+	// Check if RemoteAddr is in trusted proxy list
+	isTrustedProxy := false
+	for _, proxy := range trustedProxies {
+		if isIPInCIDR(remoteNetIP, proxy) {
+			isTrustedProxy = true
+			break
+		}
+	}
+
+	// If not a trusted proxy, return RemoteAddr directly
+	if !isTrustedProxy {
+		return remoteIP
+	}
+
+	// Get real IP from X-Forwarded-For
+	xff := r.Header.Get("X-Forwarded-For")
+	if xff != "" {
+		ips := strings.Split(xff, ",")
+		for _, ip := range ips {
+			ip = strings.TrimSpace(ip)
+			if parsedIP := net.ParseIP(ip); parsedIP != nil {
+				return parsedIP.String()
+			}
+		}
+	}
+
+	// Try X-Real-IP
+	xri := strings.TrimSpace(r.Header.Get("X-Real-Ip"))
+	if xri != "" {
+		if parsedIP := net.ParseIP(xri); parsedIP != nil {
+			return parsedIP.String()
+		}
+	}
+
+	return remoteIP
+}
+
+// isIPInCIDR checks if an IP is in a CIDR range
+func isIPInCIDR(ip net.IP, cidr string) bool {
+	// If it's a plain IP, compare directly
+	if parsedIP := net.ParseIP(cidr); parsedIP != nil {
+		return ip.Equal(parsedIP)
+	}
+
+	// Parse CIDR
+	_, ipNet, err := net.ParseCIDR(cidr)
+	if err != nil {
+		return false
+	}
+
+	return ipNet.Contains(ip)
 }
 
 // withIPAllowlist is a middleware that checks if the client IP is in the allowlist
@@ -54,17 +134,20 @@ func (a *App) withIPAllowlist(next http.HandlerFunc) http.HandlerFunc {
 			return
 		}
 
-		ip := clientIP(r)
-		if ip == "" {
+		// Get real IP
+		realIP := getRealIP(r, a.trustedProxies)
+		if realIP == "" {
 			http.Error(w, "cannot determine client IP", http.StatusForbidden)
 			return
 		}
 
 		// Check if IP is in allowlist
-		allowed := a.isIPAllowed(ip)
+		allowed := a.isIPAllowed(realIP)
 		if !allowed {
-			_ = a.insertLoginAudit(ip, r.UserAgent(), false, "ip_not_allowed")
-			http.Error(w, "access denied", http.StatusForbidden)
+			_ = a.insertLoginAudit(realIP, r.UserAgent(), false, "ip_not_allowed")
+			_ = a.insertOpAudit("security.ip_blocked", "", "ip="+realIP+" path="+r.URL.Path, realIP, strings.TrimSpace(r.UserAgent()))
+			w.WriteHeader(http.StatusForbidden)
+			_ = json.NewEncoder(w).Encode(map[string]string{"error": "access denied: IP not in allowlist"})
 			return
 		}
 
@@ -119,9 +202,9 @@ func (a *App) handleIPAllowlist(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		_ = json.NewEncoder(w).Encode(map[string]any{
-			"ok":     true,
-			"items":  entries,
-			"count":  len(entries),
+			"success": true,
+			"items":   entries,
+			"count":   len(entries),
 			"enabled": a.ipAllowlistEnabled,
 		})
 
@@ -179,9 +262,9 @@ func (a *App) handleIPAllowlist(w http.ResponseWriter, r *http.Request) {
 		a.loadSecuritySettings()
 
 		_ = json.NewEncoder(w).Encode(map[string]any{
-			"ok":   true,
-			"id":   id,
-			"ipCidr": ipCidr,
+			"success": true,
+			"id":      id,
+			"ipCidr":  ipCidr,
 		})
 
 	default:
@@ -229,7 +312,7 @@ func (a *App) handleIPAllowlistByID(w http.ResponseWriter, r *http.Request) {
 		// Reload cache
 		a.loadSecuritySettings()
 
-		_ = json.NewEncoder(w).Encode(map[string]any{"ok": true})
+		_ = json.NewEncoder(w).Encode(map[string]any{"success": true})
 
 	case http.MethodPut:
 		// Update entry
@@ -294,7 +377,7 @@ func (a *App) handleIPAllowlistByID(w http.ResponseWriter, r *http.Request) {
 		// Reload cache
 		a.loadSecuritySettings()
 
-		_ = json.NewEncoder(w).Encode(map[string]any{"ok": true})
+		_ = json.NewEncoder(w).Encode(map[string]any{"success": true})
 
 	default:
 		w.WriteHeader(http.StatusMethodNotAllowed)
@@ -306,7 +389,7 @@ func (a *App) handleSecuritySettings(w http.ResponseWriter, r *http.Request) {
 	switch r.Method {
 	case http.MethodGet:
 		_ = json.NewEncoder(w).Encode(map[string]any{
-			"ok":                 true,
+			"success":            true,
 			"ipAllowlistEnabled": a.ipAllowlistEnabled,
 			"trustedProxies":     a.trustedProxies,
 		})
@@ -323,18 +406,27 @@ func (a *App) handleSecuritySettings(w http.ResponseWriter, r *http.Request) {
 
 		if req.IPAllowlistEnabled != nil {
 			a.ipAllowlistEnabled = *req.IPAllowlistEnabled
+			// Save to database
+			enabled := "false"
+			if *req.IPAllowlistEnabled {
+				enabled = "true"
+			}
+			_ = a.setState("ip_allowlist_enabled", enabled)
 		}
 
 		if req.TrustedProxies != nil {
 			a.trustedProxies = req.TrustedProxies
+			// Save to database
+			proxiesJSON, _ := json.Marshal(req.TrustedProxies)
+			_ = a.setState("trusted_proxies", string(proxiesJSON))
 		}
 
-		_ = a.insertOpAudit("security.settings.update", "security", 
+		_ = a.insertOpAudit("security.settings.update", "security",
 			fmt.Sprintf("ipAllowlistEnabled=%v trustedProxies=%v", a.ipAllowlistEnabled, a.trustedProxies),
 			clientIP(r), r.UserAgent())
 
 		_ = json.NewEncoder(w).Encode(map[string]any{
-			"ok":                 true,
+			"success":            true,
 			"ipAllowlistEnabled": a.ipAllowlistEnabled,
 			"trustedProxies":     a.trustedProxies,
 		})

@@ -8,7 +8,9 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log"
 	"net/http"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -28,27 +30,33 @@ const (
 	PermSecurityWrite  = "security:write"
 	PermBackupsRead    = "backups:read"
 	PermBackupsWrite   = "backups:write"
+	PermActivate       = "activate"
+	PermRollback       = "rollback"
+	PermMetricsRead    = "metrics:read"
 )
 
 // Role constants
 const (
-	RoleAdmin  = "admin"
-	RoleEditor = "editor"
-	RoleViewer = "viewer"
+	RoleAdmin    = "admin"
+	RoleEditor   = "editor"
+	RoleOperator = "operator"
+	RoleViewer   = "viewer"
 )
 
 // User represents a user in the system
 type User struct {
-	ID        int64     `json:"id"`
-	Username  string    `json:"username"`
-	Email     string    `json:"email,omitempty"`
-	RoleID    int64     `json:"roleId"`
-	RoleName  string    `json:"roleName,omitempty"`
-	Active    bool      `json:"active"`
-	TOTPEnabled bool    `json:"totpEnabled"`
-	CreatedAt time.Time `json:"createdAt"`
-	UpdatedAt time.Time `json:"updatedAt"`
-	LastLogin *time.Time `json:"lastLogin,omitempty"`
+	ID           int64      `json:"id"`
+	Username     string     `json:"username"`
+	PasswordHash string     `json:"-"`
+	Email        string     `json:"email,omitempty"`
+	RoleID       int64      `json:"roleId"`
+	RoleName     string     `json:"roleName,omitempty"`
+	Enabled      bool       `json:"enabled"`
+	TotpSecret   string     `json:"-"`
+	TOTPEnabled  bool       `json:"totpEnabled"`
+	CreatedAt    time.Time  `json:"createdAt"`
+	UpdatedAt    time.Time  `json:"updatedAt"`
+	LastLogin    *time.Time `json:"lastLogin,omitempty"`
 }
 
 // Role represents a role in the system
@@ -72,10 +80,34 @@ type Session struct {
 
 // Session store
 var (
-	sessions     = make(map[string]*Session)
-	sessionsMu   sync.RWMutex
-	sessionTTL   = 24 * time.Hour
+	sessions   = make(map[string]*Session)
+	sessionsMu sync.RWMutex
+	sessionTTL = 24 * time.Hour
 )
+
+// Built-in roles permissions
+var builtInRolePermissions = map[string][]string{
+	RoleAdmin: {
+		PermProvidersRead, PermProvidersWrite,
+		PermUsersRead, PermUsersWrite,
+		PermAuditRead, PermAuditCleanup,
+		PermSecurityRead, PermSecurityWrite,
+		PermBackupsRead, PermBackupsWrite,
+		PermActivate, PermRollback, PermMetricsRead,
+	},
+	RoleEditor: {
+		PermProvidersRead, PermProvidersWrite,
+		PermAuditRead, PermBackupsRead,
+		PermActivate, PermMetricsRead,
+	},
+	RoleOperator: {
+		PermProvidersRead, PermActivate,
+		PermAuditRead, PermMetricsRead,
+	},
+	RoleViewer: {
+		PermProvidersRead, PermAuditRead, PermMetricsRead,
+	},
+}
 
 // initRBACSchema initializes the RBAC database tables
 func (a *App) initRBACSchema() error {
@@ -87,7 +119,7 @@ func (a *App) initRBACSchema() error {
 		email TEXT,
 		password_hash TEXT NOT NULL,
 		role_id INTEGER NOT NULL DEFAULT 3,
-		active INTEGER NOT NULL DEFAULT 1,
+		enabled INTEGER NOT NULL DEFAULT 1,
 		totp_enabled INTEGER NOT NULL DEFAULT 0,
 		totp_secret TEXT DEFAULT '',
 		created_at TEXT NOT NULL,
@@ -95,6 +127,7 @@ func (a *App) initRBACSchema() error {
 		last_login TEXT
 	);
 	CREATE INDEX IF NOT EXISTS idx_users_username ON users(username);
+	CREATE INDEX IF NOT EXISTS idx_users_enabled ON users(enabled);
 
 	-- Roles table
 	CREATE TABLE IF NOT EXISTS roles (
@@ -103,6 +136,14 @@ func (a *App) initRBACSchema() error {
 		description TEXT,
 		permissions TEXT NOT NULL DEFAULT '[]',
 		created_at TEXT NOT NULL
+	);
+
+	-- Role permissions table (alternative storage)
+	CREATE TABLE IF NOT EXISTS role_permissions (
+		role_id INTEGER NOT NULL,
+		permission TEXT NOT NULL,
+		PRIMARY KEY (role_id, permission),
+		FOREIGN KEY (role_id) REFERENCES roles(id) ON DELETE CASCADE
 	);
 
 	-- Sessions table (for persistent sessions)
@@ -148,29 +189,19 @@ func (a *App) initDefaultRoles() error {
 	roles := []struct {
 		name        string
 		description string
-		permissions string
+		permissions []string
 	}{
-		{
-			name:        RoleAdmin,
-			description: "Full system access",
-			permissions: `["providers:read","providers:write","users:read","users:write","audit:read","audit:cleanup","security:read","security:write","backups:read","backups:write"]`,
-		},
-		{
-			name:        RoleEditor,
-			description: "Can manage providers and view audit logs",
-			permissions: `["providers:read","providers:write","audit:read","backups:read"]`,
-		},
-		{
-			name:        RoleViewer,
-			description: "Read-only access",
-			permissions: `["providers:read","audit:read"]`,
-		},
+		{name: RoleAdmin, description: "Full system access", permissions: builtInRolePermissions[RoleAdmin]},
+		{name: RoleEditor, description: "Can manage providers and view audit logs", permissions: builtInRolePermissions[RoleEditor]},
+		{name: RoleOperator, description: "Can activate providers", permissions: builtInRolePermissions[RoleOperator]},
+		{name: RoleViewer, description: "Read-only access", permissions: builtInRolePermissions[RoleViewer]},
 	}
 
 	for _, r := range roles {
+		permsJSON, _ := json.Marshal(r.permissions)
 		_, err := a.db.Exec(
 			`INSERT INTO roles(name, description, permissions, created_at) VALUES(?, ?, ?, ?)`,
-			r.name, r.description, r.permissions, now,
+			r.name, r.description, string(permsJSON), now,
 		)
 		if err != nil {
 			return err
@@ -199,7 +230,7 @@ func (a *App) initDefaultAdmin() error {
 	}
 
 	_, err = a.db.Exec(
-		`INSERT INTO users(username, email, password_hash, role_id, active, created_at, updated_at) VALUES(?, ?, ?, 1, 1, ?, ?)`,
+		`INSERT INTO users(username, email, password_hash, role_id, enabled, created_at, updated_at) VALUES(?, ?, ?, 1, 1, ?, ?)`,
 		"admin", "admin@localhost", string(passwordHash), now, now,
 	)
 	return err
@@ -209,127 +240,104 @@ func (a *App) initDefaultAdmin() error {
 func (a *App) withRBACAuth(permission string, next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		// Get user from session
-		user, ok := a.getUserFromRequest(r)
-		if !ok {
+		userID, err := a.getUserIDFromRequest(r)
+		if err != nil {
 			w.WriteHeader(http.StatusUnauthorized)
 			_ = json.NewEncoder(w).Encode(map[string]string{"error": "unauthorized"})
 			return
 		}
 
-		// Check if user is active
-		if !user.Active {
-			w.WriteHeader(http.StatusForbidden)
-			_ = json.NewEncoder(w).Encode(map[string]string{"error": "account disabled"})
-			return
-		}
-
 		// Check permission
-		if !a.hasPermission(user.RoleID, permission) {
-			_ = a.insertOpAudit("rbac.denied", "permission", fmt.Sprintf("userId=%d permission=%s", user.ID, permission), clientIP(r), r.UserAgent())
-			w.WriteHeader(http.StatusForbidden)
-			_ = json.NewEncoder(w).Encode(map[string]string{"error": "permission denied"})
-			return
+		if permission != "" {
+			ok, err := a.hasPermission(userID, permission)
+			if err != nil || !ok {
+				_ = a.insertOpAudit("rbac.denied", "permission", fmt.Sprintf("userId=%d permission=%s", userID, permission), clientIP(r), r.UserAgent())
+				w.WriteHeader(http.StatusForbidden)
+				_ = json.NewEncoder(w).Encode(map[string]string{"error": "forbidden"})
+				return
+			}
 		}
 
-		// Add user to context (simple approach: set in header for downstream)
-		r.Header.Set("X-User-ID", fmt.Sprint(user.ID))
-		r.Header.Set("X-User-Role", user.RoleName)
-
+		// Store user ID in header for downstream handlers
+		r.Header.Set("X-User-ID", fmt.Sprint(userID))
 		next(w, r)
 	}
 }
 
-// getUserFromRequest extracts user from session token
-func (a *App) getUserFromRequest(r *http.Request) (*User, bool) {
-	// Try session token from cookie or header
-	var sessionID string
-	if c, err := r.Cookie("lx_session"); err == nil {
-		sessionID = c.Value
-	}
-	if sessionID == "" {
-		sessionID = r.Header.Get("X-Session-Token")
-	}
-
-	// Fallback to legacy admin token
-	if sessionID == "" {
-		token := r.Header.Get("X-Admin-Token")
-		if token == "" {
-			token = r.URL.Query().Get("token")
-		}
-		if token == "" {
-			if c, err := r.Cookie("lx_token"); err == nil {
-				token = c.Value
-			}
-		}
-		if token == a.adminToken {
-			// Return admin user
-			return a.getUserByUsername("admin")
+// getUserIDFromRequest extracts user ID from request (session/cookie/token)
+func (a *App) getUserIDFromRequest(r *http.Request) (int64, error) {
+	// Check for session cookie
+	if c, err := r.Cookie("lx_session"); err == nil && c.Value != "" {
+		// Validate session and get user ID
+		userID, err := a.validateSession(c.Value)
+		if err == nil {
+			return userID, nil
 		}
 	}
 
-	if sessionID == "" {
-		return nil, false
+	// Fallback: check for legacy token (for backward compatibility)
+	token := r.Header.Get("X-Admin-Token")
+	if token == "" {
+		token = r.URL.Query().Get("token")
 	}
-
-	// Get session
-	session, ok := getSession(sessionID)
-	if !ok {
-		// Try database session
-		session, ok = a.getDBSession(sessionID)
-		if !ok {
-			return nil, false
+	if token == "" {
+		if c, err := r.Cookie("lx_token"); err == nil {
+			token = c.Value
 		}
 	}
 
-	// Get user
-	return a.getUserByID(session.UserID)
+	if token == a.adminToken {
+		// Legacy token mode: return admin user ID (ID 1)
+		return 1, nil
+	}
+
+	return 0, errors.New("no valid authentication")
 }
 
-// getSession retrieves a session from memory
-func getSession(id string) (*Session, bool) {
+// validateSession validates a session token and returns user ID
+func (a *App) validateSession(sessionID string) (int64, error) {
+	// Check memory cache first
 	sessionsMu.RLock()
-	defer sessionsMu.RUnlock()
-	s, ok := sessions[id]
-	if !ok {
-		return nil, false
+	s, ok := sessions[sessionID]
+	sessionsMu.RUnlock()
+	if ok && time.Now().Before(s.ExpiresAt) {
+		return s.UserID, nil
 	}
-	if time.Now().After(s.ExpiresAt) {
-		return nil, false
-	}
-	return s, true
-}
 
-// getDBSession retrieves a session from database
-func (a *App) getDBSession(id string) (*Session, bool) {
-	var s Session
-	var createdAt, expiresAt string
-	err := a.db.QueryRow(
-		`SELECT id, user_id, created_at, expires_at, ip, user_agent FROM sessions WHERE id = ? AND expires_at > ?`,
-		id, time.Now().Format(time.RFC3339),
-	).Scan(&s.ID, &s.UserID, &createdAt, &expiresAt, &s.IP, &s.UserAgent)
+	// Check database
+	var userID int64
+	var expiresAt string
+	err := a.db.QueryRow(`
+		SELECT user_id, expires_at FROM sessions WHERE id = ?`, sessionID).Scan(&userID, &expiresAt)
 	if err != nil {
-		return nil, false
+		return 0, err
 	}
-	s.CreatedAt, _ = time.Parse(time.RFC3339, createdAt)
-	s.ExpiresAt, _ = time.Parse(time.RFC3339, expiresAt)
-	return &s, true
+
+	// Check expiration
+	expires, err := time.Parse(time.RFC3339, expiresAt)
+	if err != nil || time.Now().After(expires) {
+		return 0, errors.New("session expired")
+	}
+
+	return userID, nil
 }
 
 // getUserByID retrieves a user by ID
-func (a *App) getUserByID(id int64) (*User, bool) {
+func (a *App) getUserByID(id int64) (*User, error) {
 	var u User
 	var createdAt, updatedAt string
 	var lastLogin sql.NullString
-	var active, totpEnabled int
+	var enabled, totpEnabled int
 	err := a.db.QueryRow(`
-		SELECT u.id, u.username, u.email, u.role_id, u.active, u.totp_enabled, u.created_at, u.updated_at, u.last_login, r.name
+		SELECT u.id, u.username, u.email, u.password_hash, u.role_id, u.enabled, u.totp_enabled, 
+		       COALESCE(u.totp_secret, ''), u.created_at, u.updated_at, u.last_login, r.name
 		FROM users u JOIN roles r ON u.role_id = r.id WHERE u.id = ?`,
 		id,
-	).Scan(&u.ID, &u.Username, &u.Email, &u.RoleID, &active, &totpEnabled, &createdAt, &updatedAt, &lastLogin, &u.RoleName)
+	).Scan(&u.ID, &u.Username, &u.Email, &u.PasswordHash, &u.RoleID, &enabled, &totpEnabled, &u.TotpSecret, &createdAt, &updatedAt, &lastLogin, &u.RoleName)
 	if err != nil {
-		return nil, false
+		return nil, err
 	}
-	u.Active = active == 1
+	u.Enabled = enabled == 1
 	u.TOTPEnabled = totpEnabled == 1
 	u.CreatedAt, _ = time.Parse(time.RFC3339, createdAt)
 	u.UpdatedAt, _ = time.Parse(time.RFC3339, updatedAt)
@@ -337,24 +345,25 @@ func (a *App) getUserByID(id int64) (*User, bool) {
 		t, _ := time.Parse(time.RFC3339, lastLogin.String)
 		u.LastLogin = &t
 	}
-	return &u, true
+	return &u, nil
 }
 
 // getUserByUsername retrieves a user by username
-func (a *App) getUserByUsername(username string) (*User, bool) {
+func (a *App) getUserByUsername(username string) (*User, error) {
 	var u User
 	var createdAt, updatedAt string
 	var lastLogin sql.NullString
-	var active, totpEnabled int
+	var enabled, totpEnabled int
 	err := a.db.QueryRow(`
-		SELECT u.id, u.username, u.email, u.role_id, u.active, u.totp_enabled, u.created_at, u.updated_at, u.last_login, r.name
+		SELECT u.id, u.username, u.email, u.password_hash, u.role_id, u.enabled, u.totp_enabled,
+		       COALESCE(u.totp_secret, ''), u.created_at, u.updated_at, u.last_login, r.name
 		FROM users u JOIN roles r ON u.role_id = r.id WHERE u.username = ?`,
 		username,
-	).Scan(&u.ID, &u.Username, &u.Email, &u.RoleID, &active, &totpEnabled, &createdAt, &updatedAt, &lastLogin, &u.RoleName)
+	).Scan(&u.ID, &u.Username, &u.Email, &u.PasswordHash, &u.RoleID, &enabled, &totpEnabled, &u.TotpSecret, &createdAt, &updatedAt, &lastLogin, &u.RoleName)
 	if err != nil {
-		return nil, false
+		return nil, err
 	}
-	u.Active = active == 1
+	u.Enabled = enabled == 1
 	u.TOTPEnabled = totpEnabled == 1
 	u.CreatedAt, _ = time.Parse(time.RFC3339, createdAt)
 	u.UpdatedAt, _ = time.Parse(time.RFC3339, updatedAt)
@@ -362,28 +371,31 @@ func (a *App) getUserByUsername(username string) (*User, bool) {
 		t, _ := time.Parse(time.RFC3339, lastLogin.String)
 		u.LastLogin = &t
 	}
-	return &u, true
+	return &u, nil
 }
 
-// hasPermission checks if a role has a specific permission
-func (a *App) hasPermission(roleID int64, permission string) bool {
+// hasPermission checks if a user has a specific permission
+func (a *App) hasPermission(userID int64, permission string) (bool, error) {
 	var permissionsJSON string
-	err := a.db.QueryRow(`SELECT permissions FROM roles WHERE id = ?`, roleID).Scan(&permissionsJSON)
+	err := a.db.QueryRow(`
+		SELECT r.permissions FROM users u 
+		JOIN roles r ON u.role_id = r.id 
+		WHERE u.id = ? AND u.enabled = 1`, userID).Scan(&permissionsJSON)
 	if err != nil {
-		return false
+		return false, err
 	}
 
 	var permissions []string
 	if err := json.Unmarshal([]byte(permissionsJSON), &permissions); err != nil {
-		return false
+		return false, err
 	}
 
 	for _, p := range permissions {
 		if p == permission {
-			return true
+			return true, nil
 		}
 	}
-	return false
+	return false, nil
 }
 
 // handleUserLogin handles user login
@@ -396,68 +408,65 @@ func (a *App) handleUserLogin(w http.ResponseWriter, r *http.Request) {
 	var req struct {
 		Username string `json:"username"`
 		Password string `json:"password"`
-		TOTPCode string `json:"totpCode"`
+		TotpCode string `json:"totpCode,omitempty"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		http.Error(w, err.Error(), http.StatusBadRequest)
+		w.WriteHeader(http.StatusBadRequest)
+		_ = json.NewEncoder(w).Encode(map[string]string{"error": "invalid request"})
 		return
 	}
 
-	username := strings.TrimSpace(req.Username)
-	password := req.Password
+	ip := clientIP(r)
+	ua := strings.TrimSpace(r.UserAgent())
 
-	if username == "" || password == "" {
-		http.Error(w, "username and password required", http.StatusBadRequest)
+	// Check rate limiting
+	if wait, blocked := a.isBlocked(ip); blocked {
+		_ = a.insertLoginAudit(ip, ua, false, "locked")
+		w.WriteHeader(http.StatusTooManyRequests)
+		_ = json.NewEncoder(w).Encode(map[string]string{"error": "too many attempts", "retryAfter": fmt.Sprintf("%d", int(wait.Seconds()))})
 		return
 	}
 
 	// Get user
-	var u User
-	var passwordHash string
-	var active, totpEnabled int
-	var totpSecret string
-	err := a.db.QueryRow(`
-		SELECT u.id, u.username, u.email, u.role_id, u.active, u.totp_enabled, u.totp_secret, u.password_hash, r.name
-		FROM users u JOIN roles r ON u.role_id = r.id WHERE u.username = ?`,
-		username,
-	).Scan(&u.ID, &u.Username, &u.Email, &u.RoleID, &active, &totpEnabled, &totpSecret, &passwordHash, &u.RoleName)
+	user, err := a.getUserByUsername(req.Username)
 	if err != nil {
-		_ = a.insertLoginAudit(clientIP(r), r.UserAgent(), false, "user_not_found")
-		http.Error(w, "invalid credentials", http.StatusUnauthorized)
+		a.recordFailure(ip)
+		_ = a.insertLoginAudit(ip, ua, false, "invalid_credentials")
+		w.WriteHeader(http.StatusUnauthorized)
+		_ = json.NewEncoder(w).Encode(map[string]string{"error": "invalid credentials"})
 		return
 	}
 
-	u.Active = active == 1
-	u.TOTPEnabled = totpEnabled == 1
-
-	// Check if user is active
-	if !u.Active {
-		_ = a.insertLoginAudit(clientIP(r), r.UserAgent(), false, "account_disabled")
-		http.Error(w, "account disabled", http.StatusForbidden)
+	// Check if user is enabled
+	if !user.Enabled {
+		_ = a.insertLoginAudit(ip, ua, false, "user_disabled")
+		w.WriteHeader(http.StatusForbidden)
+		_ = json.NewEncoder(w).Encode(map[string]string{"error": "user disabled"})
 		return
 	}
 
 	// Verify password
-	if bcrypt.CompareHashAndPassword([]byte(passwordHash), []byte(password)) != nil {
-		_ = a.insertLoginAudit(clientIP(r), r.UserAgent(), false, "invalid_password")
-		http.Error(w, "invalid credentials", http.StatusUnauthorized)
+	if bcrypt.CompareHashAndPassword([]byte(user.PasswordHash), []byte(req.Password)) != nil {
+		a.recordFailure(ip)
+		_ = a.insertLoginAudit(ip, ua, false, "invalid_credentials")
+		w.WriteHeader(http.StatusUnauthorized)
+		_ = json.NewEncoder(w).Encode(map[string]string{"error": "invalid credentials"})
 		return
 	}
 
-	// Check TOTP if enabled
-	if u.TOTPEnabled {
-		totpCode := strings.TrimSpace(req.TOTPCode)
-		if totpCode == "" {
-			_ = json.NewEncoder(w).Encode(map[string]any{
-				"ok":          false,
-				"requiresTOTP": true,
-				"message":     "TOTP code required",
-			})
+	// Check 2FA if enabled
+	if user.TOTPEnabled {
+		if req.TotpCode == "" {
+			w.WriteHeader(http.StatusUnauthorized)
+			_ = json.NewEncoder(w).Encode(map[string]string{"error": "totp_required", "message": "2FA code required"})
 			return
 		}
-		if !verifyTOTP(totpSecret, totpCode) {
-			_ = a.insertLoginAudit(clientIP(r), r.UserAgent(), false, "invalid_totp")
-			http.Error(w, "invalid TOTP code", http.StatusUnauthorized)
+
+		if !verifyTOTP(user.TotpSecret, req.TotpCode) {
+			a.recordFailure(ip)
+			_ = a.insertLoginAudit(ip, ua, false, "invalid_totp")
+			w.WriteHeader(http.StatusUnauthorized)
+			_ = json.NewEncoder(w).Encode(map[string]string{"error": "invalid 2FA code"})
 			return
 		}
 	}
@@ -465,7 +474,8 @@ func (a *App) handleUserLogin(w http.ResponseWriter, r *http.Request) {
 	// Create session
 	sessionID, err := generateSessionID()
 	if err != nil {
-		http.Error(w, "failed to create session", http.StatusInternalServerError)
+		w.WriteHeader(http.StatusInternalServerError)
+		_ = json.NewEncoder(w).Encode(map[string]string{"error": "failed to create session"})
 		return
 	}
 
@@ -473,11 +483,11 @@ func (a *App) handleUserLogin(w http.ResponseWriter, r *http.Request) {
 	expiresAt := now.Add(sessionTTL)
 	session := &Session{
 		ID:        sessionID,
-		UserID:    u.ID,
+		UserID:    user.ID,
 		CreatedAt: now,
 		ExpiresAt: expiresAt,
-		IP:        clientIP(r),
-		UserAgent: r.UserAgent(),
+		IP:        ip,
+		UserAgent: ua,
 	}
 
 	// Store session in memory
@@ -486,38 +496,35 @@ func (a *App) handleUserLogin(w http.ResponseWriter, r *http.Request) {
 	sessionsMu.Unlock()
 
 	// Store session in database
-	_, err = a.db.Exec(
+	_, _ = a.db.Exec(
 		`INSERT INTO sessions(id, user_id, created_at, expires_at, ip, user_agent) VALUES(?, ?, ?, ?, ?, ?)`,
 		session.ID, session.UserID, session.CreatedAt.Format(time.RFC3339), session.ExpiresAt.Format(time.RFC3339), session.IP, session.UserAgent,
 	)
-	if err != nil {
-		// Continue even if DB insert fails
-	}
 
 	// Update last login
-	_, _ = a.db.Exec(`UPDATE users SET last_login = ? WHERE id = ?`, now.Format(time.RFC3339), u.ID)
+	_, _ = a.db.Exec(`UPDATE users SET last_login = ? WHERE id = ?`, now.Format(time.RFC3339), user.ID)
 
-	_ = a.insertLoginAudit(clientIP(r), r.UserAgent(), true, "ok")
+	a.clearFailures(ip)
+	_ = a.insertLoginAudit(ip, ua, true, "ok")
 
 	// Set session cookie
-	secure := a.requestSecure(r)
 	http.SetCookie(w, &http.Cookie{
 		Name:     "lx_session",
 		Value:    sessionID,
 		Path:     "/",
 		HttpOnly: true,
-		Secure:   secure,
+		Secure:   a.requestSecure(r),
 		SameSite: http.SameSiteLaxMode,
 		MaxAge:   int(sessionTTL.Seconds()),
 	})
 
-	_ = json.NewEncoder(w).Encode(map[string]any{
-		"ok":        true,
-		"sessionId": sessionID,
-		"user": map[string]any{
-			"id":       u.ID,
-			"username": u.Username,
-			"role":     u.RoleName,
+	_ = json.NewEncoder(w).Encode(map[string]interface{}{
+		"success": true,
+		"user": map[string]interface{}{
+			"id":       user.ID,
+			"username": user.Username,
+			"email":    user.Email,
+			"role":     user.RoleName,
 		},
 	})
 }
@@ -530,19 +537,14 @@ func (a *App) handleUserLogout(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Get session ID
-	var sessionID string
-	if c, err := r.Cookie("lx_session"); err == nil {
-		sessionID = c.Value
-	}
-
-	if sessionID != "" {
+	if c, err := r.Cookie("lx_session"); err == nil && c.Value != "" {
 		// Remove from memory
 		sessionsMu.Lock()
-		delete(sessions, sessionID)
+		delete(sessions, c.Value)
 		sessionsMu.Unlock()
 
 		// Remove from database
-		_, _ = a.db.Exec(`DELETE FROM sessions WHERE id = ?`, sessionID)
+		_, _ = a.db.Exec(`DELETE FROM sessions WHERE id = ?`, c.Value)
 	}
 
 	// Clear session cookie
@@ -556,7 +558,7 @@ func (a *App) handleUserLogout(w http.ResponseWriter, r *http.Request) {
 		MaxAge:   -1,
 	})
 
-	_ = json.NewEncoder(w).Encode(map[string]bool{"ok": true})
+	_ = json.NewEncoder(w).Encode(map[string]bool{"success": true})
 }
 
 // handleListUsers handles listing users
@@ -567,11 +569,12 @@ func (a *App) handleListUsers(w http.ResponseWriter, r *http.Request) {
 	}
 
 	rows, err := a.db.Query(`
-		SELECT u.id, u.username, u.email, u.role_id, u.active, u.totp_enabled, u.created_at, u.updated_at, u.last_login, r.name
+		SELECT u.id, u.username, u.email, u.role_id, u.enabled, u.totp_enabled, u.created_at, u.updated_at, u.last_login, r.name
 		FROM users u JOIN roles r ON u.role_id = r.id ORDER BY u.id`,
 	)
 	if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
+		w.WriteHeader(http.StatusInternalServerError)
+		_ = json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
 		return
 	}
 	defer rows.Close()
@@ -581,12 +584,13 @@ func (a *App) handleListUsers(w http.ResponseWriter, r *http.Request) {
 		var u User
 		var createdAt, updatedAt string
 		var lastLogin sql.NullString
-		var active, totpEnabled int
-		if err := rows.Scan(&u.ID, &u.Username, &u.Email, &u.RoleID, &active, &totpEnabled, &createdAt, &updatedAt, &lastLogin, &u.RoleName); err != nil {
-			http.Error(w, err.Error(), http.StatusInternalServerError)
+		var enabled, totpEnabled int
+		if err := rows.Scan(&u.ID, &u.Username, &u.Email, &u.RoleID, &enabled, &totpEnabled, &createdAt, &updatedAt, &lastLogin, &u.RoleName); err != nil {
+			w.WriteHeader(http.StatusInternalServerError)
+			_ = json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
 			return
 		}
-		u.Active = active == 1
+		u.Enabled = enabled == 1
 		u.TOTPEnabled = totpEnabled == 1
 		u.CreatedAt, _ = time.Parse(time.RFC3339, createdAt)
 		u.UpdatedAt, _ = time.Parse(time.RFC3339, updatedAt)
@@ -601,7 +605,7 @@ func (a *App) handleListUsers(w http.ResponseWriter, r *http.Request) {
 		users = []User{}
 	}
 
-	_ = json.NewEncoder(w).Encode(map[string]any{"ok": true, "items": users, "count": len(users)})
+	_ = json.NewEncoder(w).Encode(map[string]any{"success": true, "items": users, "count": len(users)})
 }
 
 // handleCreateUser handles creating a new user
@@ -618,7 +622,8 @@ func (a *App) handleCreateUser(w http.ResponseWriter, r *http.Request) {
 		RoleID   int64  `json:"roleId"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		http.Error(w, err.Error(), http.StatusBadRequest)
+		w.WriteHeader(http.StatusBadRequest)
+		_ = json.NewEncoder(w).Encode(map[string]string{"error": "invalid request"})
 		return
 	}
 
@@ -626,45 +631,50 @@ func (a *App) handleCreateUser(w http.ResponseWriter, r *http.Request) {
 	password := strings.TrimSpace(req.Password)
 
 	if username == "" || password == "" {
-		http.Error(w, "username and password required", http.StatusBadRequest)
+		w.WriteHeader(http.StatusBadRequest)
+		_ = json.NewEncoder(w).Encode(map[string]string{"error": "username and password required"})
 		return
 	}
 
 	if len(password) < 6 {
-		http.Error(w, "password must be at least 6 characters", http.StatusBadRequest)
+		w.WriteHeader(http.StatusBadRequest)
+		_ = json.NewEncoder(w).Encode(map[string]string{"error": "password must be at least 6 characters"})
 		return
 	}
 
 	if req.RoleID == 0 {
-		req.RoleID = 3 // Default to viewer
+		req.RoleID = 4 // Default to viewer
 	}
 
 	// Hash password
 	passwordHash, err := bcrypt.GenerateFromPassword([]byte(password), bcrypt.DefaultCost)
 	if err != nil {
-		http.Error(w, "failed to hash password", http.StatusInternalServerError)
+		w.WriteHeader(http.StatusInternalServerError)
+		_ = json.NewEncoder(w).Encode(map[string]string{"error": "failed to hash password"})
 		return
 	}
 
 	now := time.Now().Format(time.RFC3339)
 	res, err := a.db.Exec(
-		`INSERT INTO users(username, email, password_hash, role_id, active, created_at, updated_at) VALUES(?, ?, ?, ?, 1, ?, ?)`,
+		`INSERT INTO users(username, email, password_hash, role_id, enabled, created_at, updated_at) VALUES(?, ?, ?, ?, 1, ?, ?)`,
 		username, req.Email, string(passwordHash), req.RoleID, now, now,
 	)
 	if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
+		w.WriteHeader(http.StatusInternalServerError)
+		_ = json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
 		return
 	}
 
 	id, _ := res.LastInsertId()
 	_ = a.insertOpAudit("user.create", "user", fmt.Sprintf("id=%d username=%s", id, username), clientIP(r), r.UserAgent())
 
-	_ = json.NewEncoder(w).Encode(map[string]any{"ok": true, "id": id})
+	w.WriteHeader(http.StatusCreated)
+	_ = json.NewEncoder(w).Encode(map[string]any{"success": true, "id": id})
 }
 
 // handleUpdateUser handles updating a user
 func (a *App) handleUpdateUser(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodPost {
+	if r.Method != http.MethodPost && r.Method != http.MethodPut {
 		w.WriteHeader(http.StatusMethodNotAllowed)
 		return
 	}
@@ -674,15 +684,25 @@ func (a *App) handleUpdateUser(w http.ResponseWriter, r *http.Request) {
 		Email    *string `json:"email"`
 		Password *string `json:"password"`
 		RoleID   *int64  `json:"roleId"`
-		Active   *bool   `json:"active"`
+		Enabled  *bool   `json:"enabled"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		http.Error(w, err.Error(), http.StatusBadRequest)
+		w.WriteHeader(http.StatusBadRequest)
+		_ = json.NewEncoder(w).Encode(map[string]string{"error": "invalid request"})
 		return
 	}
 
 	if req.ID == 0 {
-		http.Error(w, "id required", http.StatusBadRequest)
+		// Try to get ID from URL
+		idStr := r.URL.Query().Get("id")
+		if idStr != "" {
+			req.ID, _ = strconv.ParseInt(idStr, 10, 64)
+		}
+	}
+
+	if req.ID == 0 {
+		w.WriteHeader(http.StatusBadRequest)
+		_ = json.NewEncoder(w).Encode(map[string]string{"error": "id required"})
 		return
 	}
 
@@ -697,7 +717,8 @@ func (a *App) handleUpdateUser(w http.ResponseWriter, r *http.Request) {
 	if req.Password != nil && *req.Password != "" {
 		passwordHash, err := bcrypt.GenerateFromPassword([]byte(*req.Password), bcrypt.DefaultCost)
 		if err != nil {
-			http.Error(w, "failed to hash password", http.StatusInternalServerError)
+			w.WriteHeader(http.StatusInternalServerError)
+			_ = json.NewEncoder(w).Encode(map[string]string{"error": "failed to hash password"})
 			return
 		}
 		updates = append(updates, "password_hash = ?")
@@ -709,17 +730,18 @@ func (a *App) handleUpdateUser(w http.ResponseWriter, r *http.Request) {
 		args = append(args, *req.RoleID)
 	}
 
-	if req.Active != nil {
-		updates = append(updates, "active = ?")
-		var active int
-		if *req.Active {
-			active = 1
+	if req.Enabled != nil {
+		updates = append(updates, "enabled = ?")
+		var enabled int
+		if *req.Enabled {
+			enabled = 1
 		}
-		args = append(args, active)
+		args = append(args, enabled)
 	}
 
 	if len(updates) == 0 {
-		http.Error(w, "no fields to update", http.StatusBadRequest)
+		w.WriteHeader(http.StatusBadRequest)
+		_ = json.NewEncoder(w).Encode(map[string]string{"error": "no fields to update"})
 		return
 	}
 
@@ -730,18 +752,19 @@ func (a *App) handleUpdateUser(w http.ResponseWriter, r *http.Request) {
 	query := "UPDATE users SET " + strings.Join(updates, ", ") + " WHERE id = ?"
 	_, err := a.db.Exec(query, args...)
 	if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
+		w.WriteHeader(http.StatusInternalServerError)
+		_ = json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
 		return
 	}
 
 	_ = a.insertOpAudit("user.update", "user", fmt.Sprintf("id=%d", req.ID), clientIP(r), r.UserAgent())
 
-	_ = json.NewEncoder(w).Encode(map[string]bool{"ok": true})
+	_ = json.NewEncoder(w).Encode(map[string]bool{"success": true})
 }
 
 // handleDeleteUser handles deleting a user
 func (a *App) handleDeleteUser(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodPost {
+	if r.Method != http.MethodPost && r.Method != http.MethodDelete {
 		w.WriteHeader(http.StatusMethodNotAllowed)
 		return
 	}
@@ -749,13 +772,26 @@ func (a *App) handleDeleteUser(w http.ResponseWriter, r *http.Request) {
 	var req struct {
 		ID int64 `json:"id"`
 	}
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		http.Error(w, err.Error(), http.StatusBadRequest)
-		return
+	if r.Method == http.MethodPost {
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			w.WriteHeader(http.StatusBadRequest)
+			_ = json.NewEncoder(w).Encode(map[string]string{"error": "invalid request"})
+			return
+		}
+	} else {
+		// DELETE method, get ID from URL
+		idStr := r.URL.Query().Get("id")
+		if idStr == "" {
+			w.WriteHeader(http.StatusBadRequest)
+			_ = json.NewEncoder(w).Encode(map[string]string{"error": "id required"})
+			return
+		}
+		req.ID, _ = strconv.ParseInt(idStr, 10, 64)
 	}
 
 	if req.ID == 0 {
-		http.Error(w, "id required", http.StatusBadRequest)
+		w.WriteHeader(http.StatusBadRequest)
+		_ = json.NewEncoder(w).Encode(map[string]string{"error": "id required"})
 		return
 	}
 
@@ -769,9 +805,10 @@ func (a *App) handleDeleteUser(w http.ResponseWriter, r *http.Request) {
 
 	if roleID == 1 { // Admin role
 		var adminCount int
-		a.db.QueryRow(`SELECT COUNT(1) FROM users WHERE role_id = 1`).Scan(&adminCount)
+		a.db.QueryRow(`SELECT COUNT(1) FROM users WHERE role_id = 1 AND enabled = 1`).Scan(&adminCount)
 		if adminCount <= 1 {
-			http.Error(w, "cannot delete the last admin user", http.StatusBadRequest)
+			w.WriteHeader(http.StatusBadRequest)
+			_ = json.NewEncoder(w).Encode(map[string]string{"error": "cannot delete the last admin user"})
 			return
 		}
 	}
@@ -782,13 +819,14 @@ func (a *App) handleDeleteUser(w http.ResponseWriter, r *http.Request) {
 	// Delete user
 	_, err = a.db.Exec(`DELETE FROM users WHERE id = ?`, req.ID)
 	if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
+		w.WriteHeader(http.StatusInternalServerError)
+		_ = json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
 		return
 	}
 
 	_ = a.insertOpAudit("user.delete", "user", fmt.Sprintf("id=%d", req.ID), clientIP(r), r.UserAgent())
 
-	_ = json.NewEncoder(w).Encode(map[string]bool{"ok": true})
+	_ = json.NewEncoder(w).Encode(map[string]bool{"success": true})
 }
 
 // handleListRoles handles listing roles
@@ -800,7 +838,8 @@ func (a *App) handleListRoles(w http.ResponseWriter, r *http.Request) {
 
 	rows, err := a.db.Query(`SELECT id, name, description, permissions, created_at FROM roles ORDER BY id`)
 	if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
+		w.WriteHeader(http.StatusInternalServerError)
+		_ = json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
 		return
 	}
 	defer rows.Close()
@@ -810,7 +849,8 @@ func (a *App) handleListRoles(w http.ResponseWriter, r *http.Request) {
 		var r Role
 		var createdAt, permissionsJSON string
 		if err := rows.Scan(&r.ID, &r.Name, &r.Description, &permissionsJSON, &createdAt); err != nil {
-			http.Error(w, err.Error(), http.StatusInternalServerError)
+			w.WriteHeader(http.StatusInternalServerError)
+			_ = json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
 			return
 		}
 		json.Unmarshal([]byte(permissionsJSON), &r.Permissions)
@@ -822,7 +862,7 @@ func (a *App) handleListRoles(w http.ResponseWriter, r *http.Request) {
 		roles = []Role{}
 	}
 
-	_ = json.NewEncoder(w).Encode(map[string]any{"ok": true, "items": roles, "count": len(roles)})
+	_ = json.NewEncoder(w).Encode(map[string]any{"success": true, "items": roles, "count": len(roles)})
 }
 
 // generateSessionID generates a random session ID
@@ -858,7 +898,10 @@ func (a *App) cleanupSessions() {
 	sessionsMu.Unlock()
 
 	// Clean database sessions
-	_, _ = a.db.Exec(`DELETE FROM sessions WHERE expires_at < ?`, now.Format(time.RFC3339))
+	_, err := a.db.Exec(`DELETE FROM sessions WHERE expires_at < ?`, now.Format(time.RFC3339))
+	if err != nil {
+		log.Printf("session cleanup error: %v", err)
+	}
 }
 
 // secureCompare performs a constant-time comparison

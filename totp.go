@@ -6,6 +6,7 @@ import (
 	"crypto/rand"
 	"crypto/sha1"
 	"encoding/base32"
+	"encoding/binary"
 	"encoding/json"
 	"fmt"
 	"net/http"
@@ -42,14 +43,24 @@ func (a *App) handleEnableTOTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Get current user from session (using admin token for simplicity)
-	userID := int64(1) // Default admin user
-	username := "admin"
+	// Get current user from session
+	userID, err := a.getUserIDFromRequest(r)
+	if err != nil {
+		w.WriteHeader(http.StatusUnauthorized)
+		_ = json.NewEncoder(w).Encode(map[string]string{"error": "unauthorized"})
+		return
+	}
+
+	// Get user info
+	user, err := a.getUserByID(userID)
+	if err != nil {
+		w.WriteHeader(http.StatusInternalServerError)
+		_ = json.NewEncoder(w).Encode(map[string]string{"error": "failed to get user"})
+		return
+	}
 
 	// Check if TOTP is already enabled
-	var enabled int
-	err := a.db.QueryRow(`SELECT totp_enabled FROM users WHERE id = ?`, userID).Scan(&enabled)
-	if err == nil && enabled == 1 {
+	if user.TOTPEnabled {
 		http.Error(w, "TOTP already enabled", http.StatusBadRequest)
 		return
 	}
@@ -71,7 +82,7 @@ func (a *App) handleEnableTOTP(w http.ResponseWriter, r *http.Request) {
 
 	// Generate QR code URL
 	issuer := "lx-switch"
-	account := username
+	account := user.Username
 	qrCodeURL := fmt.Sprintf("otpauth://totp/%s:%s?secret=%s&issuer=%s&algorithm=SHA1&digits=6&period=30",
 		issuer, account, secret, issuer)
 
@@ -83,10 +94,10 @@ func (a *App) handleEnableTOTP(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Return QR code as base64 and secret
-	qrBase64 := base32.StdEncoding.EncodeToString(qrBytes)
-	
+	qrBase64 := base64.StdEncoding.EncodeToString(qrBytes)
+
 	_ = json.NewEncoder(w).Encode(map[string]any{
-		"ok":         true,
+		"success":    true,
 		"secret":     secret,
 		"qrCodeUrl":  qrCodeURL,
 		"qrCodeData": "data:image/png;base64," + qrBase64,
@@ -135,7 +146,7 @@ func (a *App) handleConfirmTOTP(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Verify the code
-	if !verifyTOTP(secret, code) {
+	if !verifyTOTPCode(secret, code) {
 		http.Error(w, "invalid code, please try again", http.StatusBadRequest)
 		return
 	}
@@ -156,7 +167,7 @@ func (a *App) handleConfirmTOTP(w http.ResponseWriter, r *http.Request) {
 	_ = a.insertOpAudit("security.totp.enable", "security", fmt.Sprintf("userId=%d", tempSecret.UserID), clientIP(r), r.UserAgent())
 
 	_ = json.NewEncoder(w).Encode(map[string]any{
-		"ok":      true,
+		"success": true,
 		"message": "TOTP enabled successfully",
 	})
 }
@@ -177,18 +188,22 @@ func (a *App) handleDisableTOTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	userID := int64(1) // Default admin user
+	// Get current user from session
+	userID, err := a.getUserIDFromRequest(r)
+	if err != nil {
+		w.WriteHeader(http.StatusUnauthorized)
+		_ = json.NewEncoder(w).Encode(map[string]string{"error": "unauthorized"})
+		return
+	}
 
 	// Get current TOTP secret
-	var totpEnabled int
-	var totpSecret string
-	err := a.db.QueryRow(`SELECT totp_enabled, totp_secret FROM users WHERE id = ?`, userID).Scan(&totpEnabled, &totpSecret)
+	user, err := a.getUserByID(userID)
 	if err != nil {
 		http.Error(w, "user not found", http.StatusNotFound)
 		return
 	}
 
-	if totpEnabled == 0 {
+	if !user.TOTPEnabled {
 		http.Error(w, "TOTP not enabled", http.StatusBadRequest)
 		return
 	}
@@ -200,7 +215,7 @@ func (a *App) handleDisableTOTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if !verifyTOTP(totpSecret, code) {
+	if !verifyTOTPCode(user.TotpSecret, code) {
 		http.Error(w, "invalid code", http.StatusBadRequest)
 		return
 	}
@@ -218,7 +233,7 @@ func (a *App) handleDisableTOTP(w http.ResponseWriter, r *http.Request) {
 	_ = a.insertOpAudit("security.totp.disable", "security", fmt.Sprintf("userId=%d", userID), clientIP(r), r.UserAgent())
 
 	_ = json.NewEncoder(w).Encode(map[string]any{
-		"ok":      true,
+		"success": true,
 		"message": "TOTP disabled successfully",
 	})
 }
@@ -236,8 +251,8 @@ func generateTOTPSecret() (string, error) {
 	return strings.TrimRight(encoded, "="), nil
 }
 
-// verifyTOTP verifies a TOTP code
-func verifyTOTP(secret, code string) bool {
+// verifyTOTPCode verifies a TOTP code against a secret
+func verifyTOTPCode(secret, code string) bool {
 	// Pad secret if needed
 	secret = strings.ToUpper(strings.TrimSpace(secret))
 	if l := len(secret) % 8; l != 0 {
@@ -253,7 +268,7 @@ func verifyTOTP(secret, code string) bool {
 	// Get current time step (30 second intervals)
 	now := time.Now().Unix() / 30
 
-	// Check current and adjacent time steps (allow 1 step drift)
+	// Check current and adjacent time steps (allow 1 step drift for clock skew)
 	for i := -1; i <= 1; i++ {
 		expectedCode := generateTOTPCode(key, now+int64(i))
 		if subtleConstantTimeCompare(code, expectedCode) {
@@ -264,14 +279,16 @@ func verifyTOTP(secret, code string) bool {
 	return false
 }
 
+// verifyTOTP is an alias for verifyTOTPCode (for backward compatibility)
+func (a *App) verifyTOTP(secret, code string) bool {
+	return verifyTOTPCode(secret, code)
+}
+
 // generateTOTPCode generates a TOTP code for a given time step
 func generateTOTPCode(key []byte, timeStep int64) string {
 	// Convert time step to big-endian bytes
 	timeBytes := make([]byte, 8)
-	for i := 7; i >= 0; i-- {
-		timeBytes[i] = byte(timeStep & 0xff)
-		timeStep >>= 8
-	}
+	binary.BigEndian.PutUint64(timeBytes, uint64(timeStep))
 
 	// HMAC-SHA1
 	h := hmac.New(sha1.New, key)
@@ -280,11 +297,11 @@ func generateTOTPCode(key []byte, timeStep int64) string {
 
 	// Dynamic truncation
 	offset := hash[len(hash)-1] & 0x0f
-	code := int32(hash[offset]&0x7f)<<24 |
-		int32(hash[offset+1])<<16 |
-		int32(hash[offset+2])<<8 |
-		int32(hash[offset+3])
-	code = code % 1000000
+	truncated := binary.BigEndian.Uint32(hash[offset : offset+4])
+	truncated &= 0x7fffffff
+
+	// Generate 6-digit code
+	code := truncated % 1000000
 
 	return fmt.Sprintf("%06d", code)
 }
@@ -297,4 +314,10 @@ func subtleConstantTimeCompare(a, b string) bool {
 	a = strings.TrimSpace(a)
 	b = strings.TrimSpace(b)
 	return bytes.Equal([]byte(a), []byte(b))
+}
+
+// generateTOTPURI generates a TOTP URI for QR code
+func generateTOTPURI(secret, issuer, accountName string) string {
+	return fmt.Sprintf("otpauth://totp/%s:%s?secret=%s&issuer=%s",
+		issuer, accountName, secret, issuer)
 }
