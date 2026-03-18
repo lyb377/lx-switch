@@ -46,6 +46,68 @@ var (
 	totpSecretsMu sync.Mutex
 )
 
+func hashRecoveryCode(code string) string {
+	sum := sha256.Sum256([]byte(strings.TrimSpace(strings.ToLower(code))))
+	return hex.EncodeToString(sum[:])
+}
+
+func generateRecoveryCodes(n int) ([]string, error) {
+	if n <= 0 {
+		return []string{}, nil
+	}
+	out := make([]string, 0, n)
+	for i := 0; i < n; i++ {
+		b := make([]byte, 10) // 80-bit
+		if _, err := rand.Read(b); err != nil {
+			return nil, err
+		}
+		code := strings.ToLower(strings.TrimRight(base32.StdEncoding.EncodeToString(b), "="))
+		out = append(out, code)
+	}
+	return out, nil
+}
+
+func (a *App) replaceRecoveryCodes(userID int64) ([]string, error) {
+	codes, err := generateRecoveryCodes(8)
+	if err != nil {
+		return nil, err
+	}
+	now := time.Now().Format(time.RFC3339)
+
+	tx, err := a.db.Begin()
+	if err != nil {
+		return nil, err
+	}
+	defer tx.Rollback()
+
+	if _, err := tx.Exec(`DELETE FROM totp_recovery_codes WHERE user_id = ?`, userID); err != nil {
+		return nil, err
+	}
+	for _, c := range codes {
+		if _, err := tx.Exec(`INSERT INTO totp_recovery_codes(user_id, code_hash, created_at) VALUES(?, ?, ?)`, userID, hashRecoveryCode(c), now); err != nil {
+			return nil, err
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return nil, err
+	}
+	return codes, nil
+}
+
+func (a *App) consumeRecoveryCode(userID int64, code string) (bool, error) {
+	code = strings.TrimSpace(strings.ToLower(code))
+	if code == "" {
+		return false, nil
+	}
+	now := time.Now().Format(time.RFC3339)
+	res, err := a.db.Exec(`UPDATE totp_recovery_codes SET used_at = ? WHERE user_id = ? AND code_hash = ? AND used_at IS NULL`, now, userID, hashRecoveryCode(code))
+	if err != nil {
+		return false, err
+	}
+	aff, _ := res.RowsAffected()
+	return aff > 0, nil
+}
+
 func qrCodeDataURL(text string, size int) (string, error) {
 	c, err := qr.Encode(text, qr.M, qr.Auto)
 	if err != nil {
@@ -201,6 +263,12 @@ func (a *App) handleConfirmTOTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	recoveryCodes, err := a.replaceRecoveryCodes(tempSecret.UserID)
+	if err != nil {
+		http.Error(w, "failed to generate recovery codes", http.StatusInternalServerError)
+		return
+	}
+
 	// Mark as confirmed and clean up
 	totpSecretsMu.Lock()
 	delete(totpSecrets, secret)
@@ -209,8 +277,9 @@ func (a *App) handleConfirmTOTP(w http.ResponseWriter, r *http.Request) {
 	_ = a.insertOpAudit("security.totp.enable", "security", fmt.Sprintf("userId=%d", tempSecret.UserID), clientIP(r), r.UserAgent())
 
 	_ = json.NewEncoder(w).Encode(map[string]any{
-		"success": true,
-		"message": "TOTP enabled successfully",
+		"success":       true,
+		"message":       "TOTP enabled successfully",
+		"recoveryCodes": recoveryCodes,
 	})
 }
 
@@ -222,7 +291,9 @@ func (a *App) handleDisableTOTP(w http.ResponseWriter, r *http.Request) {
 	}
 
 	var req struct {
-		Code string `json:"code"`
+		Code         string `json:"code"`         // TOTP code
+		RecoveryCode string `json:"recoveryCode"` // Recovery code
+		Password     string `json:"password"`     // Optional: password confirmation
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
@@ -249,14 +320,28 @@ func (a *App) handleDisableTOTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Verify the code before disabling
-	code := strings.TrimSpace(req.Code)
-	if code == "" {
-		http.Error(w, "code required", http.StatusBadRequest)
-		return
+	// Optional password confirmation.
+	if strings.TrimSpace(req.Password) != "" {
+		if !verifyPassword(user.PasswordHash, req.Password) {
+			http.Error(w, "invalid password", http.StatusUnauthorized)
+			return
+		}
 	}
 
-	if !verifyTOTPCode(user.TotpSecret, code) {
+	// Verify the code (TOTP or recovery code) before disabling.
+	ok := false
+	if strings.TrimSpace(req.Code) != "" {
+		ok = verifyTOTPCode(user.TotpSecret, strings.TrimSpace(req.Code))
+	}
+	if !ok && strings.TrimSpace(req.RecoveryCode) != "" {
+		used, err := a.consumeRecoveryCode(userID, req.RecoveryCode)
+		if err != nil {
+			http.Error(w, "failed to verify recovery code", http.StatusInternalServerError)
+			return
+		}
+		ok = used
+	}
+	if !ok {
 		http.Error(w, "invalid code", http.StatusBadRequest)
 		return
 	}
@@ -270,6 +355,8 @@ func (a *App) handleDisableTOTP(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "failed to disable TOTP", http.StatusInternalServerError)
 		return
 	}
+
+	_, _ = a.db.Exec(`DELETE FROM totp_recovery_codes WHERE user_id = ?`, userID)
 
 	_ = a.insertOpAudit("security.totp.disable", "security", fmt.Sprintf("userId=%d", userID), clientIP(r), r.UserAgent())
 
