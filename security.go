@@ -431,6 +431,66 @@ func (a *App) handleSecuritySettings(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 
+		// Validate & normalize trusted proxies (IP or CIDR).
+		if req.TrustedProxies != nil {
+			normalized := make([]string, 0, len(req.TrustedProxies))
+			for _, raw := range req.TrustedProxies {
+				s := strings.TrimSpace(raw)
+				if s == "" {
+					continue
+				}
+				if strings.Contains(s, "/") {
+					if _, _, err := net.ParseCIDR(s); err != nil {
+						http.Error(w, "invalid trustedProxies CIDR: "+s, http.StatusBadRequest)
+						return
+					}
+				} else {
+					if net.ParseIP(s) == nil {
+						http.Error(w, "invalid trustedProxies IP: "+s, http.StatusBadRequest)
+						return
+					}
+				}
+				normalized = append(normalized, s)
+			}
+			if normalized == nil {
+				normalized = []string{}
+			}
+			req.TrustedProxies = normalized
+		}
+
+		// Prevent foot-gun: if enabling allowlist, ensure there is at least one enabled entry
+		// AND the current request IP will remain allowed under the new trusted proxy settings.
+		if req.IPAllowlistEnabled != nil && *req.IPAllowlistEnabled {
+			// Ensure cache reflects latest DB changes.
+			a.loadSecuritySettings()
+
+			allowlistCache.mu.RLock()
+			entries := allowlistCache.entries
+			allowlistCache.mu.RUnlock()
+
+			hasEnabled := false
+			for _, e := range entries {
+				if e.Enabled {
+					hasEnabled = true
+					break
+				}
+			}
+			if !hasEnabled {
+				http.Error(w, "cannot enable allowlist: no enabled ip_allowlist entries", http.StatusBadRequest)
+				return
+			}
+
+			proposedTrusted := a.trustedProxies
+			if req.TrustedProxies != nil {
+				proposedTrusted = req.TrustedProxies
+			}
+			realIP := getRealIP(r, proposedTrusted)
+			if realIP == "" || !a.isIPAllowed(realIP) {
+				http.Error(w, "cannot enable allowlist: current IP not allowed ("+realIP+")", http.StatusBadRequest)
+				return
+			}
+		}
+
 		if req.IPAllowlistEnabled != nil {
 			a.ipAllowlistEnabled = *req.IPAllowlistEnabled
 			// Save to database
@@ -451,6 +511,9 @@ func (a *App) handleSecuritySettings(w http.ResponseWriter, r *http.Request) {
 		_ = a.insertOpAudit("security.settings.update", "security",
 			fmt.Sprintf("ipAllowlistEnabled=%v trustedProxies=%v", a.ipAllowlistEnabled, a.trustedProxies),
 			clientIP(r), r.UserAgent())
+
+		// Reload cache after settings update (so new trusted proxies/enable state takes effect immediately).
+		a.loadSecuritySettings()
 
 		_ = json.NewEncoder(w).Encode(map[string]any{
 			"success":            true,

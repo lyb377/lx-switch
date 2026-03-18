@@ -5,15 +5,20 @@ import (
 	"crypto/hmac"
 	"crypto/rand"
 	"crypto/sha1"
+	"crypto/subtle"
 	"encoding/base32"
+	"encoding/base64"
 	"encoding/binary"
 	"encoding/json"
 	"fmt"
+	"image/png"
 	"net/http"
 	"strings"
+	"sync"
 	"time"
 
-	"github.com/skip2/go-qrcode"
+	"github.com/boombuler/barcode"
+	"github.com/boombuler/barcode/qr"
 )
 
 // TOTPConfig holds TOTP configuration for a user
@@ -34,7 +39,26 @@ type TOTPSecret struct {
 }
 
 // totpSecrets stores temporary TOTP secrets during setup (in-memory, cleared on restart)
-var totpSecrets = make(map[string]*TOTPSecret)
+var (
+	totpSecrets   = make(map[string]*TOTPSecret)
+	totpSecretsMu sync.Mutex
+)
+
+func qrCodeDataURL(text string, size int) (string, error) {
+	c, err := qr.Encode(text, qr.M, qr.Auto)
+	if err != nil {
+		return "", err
+	}
+	c, err = barcode.Scale(c, size, size)
+	if err != nil {
+		return "", err
+	}
+	var buf bytes.Buffer
+	if err := png.Encode(&buf, c); err != nil {
+		return "", err
+	}
+	return "data:image/png;base64," + base64.StdEncoding.EncodeToString(buf.Bytes()), nil
+}
 
 // handleEnableTOTP initiates TOTP setup for a user
 func (a *App) handleEnableTOTP(w http.ResponseWriter, r *http.Request) {
@@ -71,36 +95,33 @@ func (a *App) handleEnableTOTP(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "failed to generate secret", http.StatusInternalServerError)
 		return
 	}
+	secret = strings.ToUpper(strings.TrimSpace(secret))
 
 	// Store secret temporarily
+	totpSecretsMu.Lock()
 	totpSecrets[secret] = &TOTPSecret{
 		UserID:    userID,
 		Secret:    secret,
 		CreatedAt: time.Now(),
 		Confirmed: false,
 	}
+	totpSecretsMu.Unlock()
 
 	// Generate QR code URL
 	issuer := "lx-switch"
 	account := user.Username
-	qrCodeURL := fmt.Sprintf("otpauth://totp/%s:%s?secret=%s&issuer=%s&algorithm=SHA1&digits=6&period=30",
-		issuer, account, secret, issuer)
-
-	// Generate QR code image
-	qrBytes, err := qrcode.Encode(qrCodeURL, qrcode.Medium, 256)
+	qrCodeURL := generateTOTPURI(secret, issuer, account)
+	qrDataURL, err := qrCodeDataURL(qrCodeURL, 256)
 	if err != nil {
 		http.Error(w, "failed to generate QR code", http.StatusInternalServerError)
 		return
 	}
 
-	// Return QR code as base64 and secret
-	qrBase64 := base64.StdEncoding.EncodeToString(qrBytes)
-
 	_ = json.NewEncoder(w).Encode(map[string]any{
 		"success":    true,
 		"secret":     secret,
 		"qrCodeUrl":  qrCodeURL,
-		"qrCodeData": "data:image/png;base64," + qrBase64,
+		"qrCodeData": qrDataURL,
 		"issuer":     issuer,
 		"account":    account,
 		"message":    "Scan the QR code with your authenticator app, then confirm with a code",
@@ -111,6 +132,14 @@ func (a *App) handleEnableTOTP(w http.ResponseWriter, r *http.Request) {
 func (a *App) handleConfirmTOTP(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		w.WriteHeader(http.StatusMethodNotAllowed)
+		return
+	}
+
+	// Require authentication; confirm must match current user
+	userID, err := a.getUserIDFromRequest(r)
+	if err != nil {
+		w.WriteHeader(http.StatusUnauthorized)
+		_ = json.NewEncoder(w).Encode(map[string]string{"error": "unauthorized"})
 		return
 	}
 
@@ -132,15 +161,24 @@ func (a *App) handleConfirmTOTP(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Check if secret exists in temporary storage
+	totpSecretsMu.Lock()
 	tempSecret, exists := totpSecrets[secret]
+	totpSecretsMu.Unlock()
 	if !exists {
 		http.Error(w, "invalid or expired secret", http.StatusBadRequest)
+		return
+	}
+	if tempSecret.UserID != userID {
+		w.WriteHeader(http.StatusForbidden)
+		_ = json.NewEncoder(w).Encode(map[string]string{"error": "forbidden"})
 		return
 	}
 
 	// Check if secret is expired (5 minutes)
 	if time.Since(tempSecret.CreatedAt) > 5*time.Minute {
+		totpSecretsMu.Lock()
 		delete(totpSecrets, secret)
+		totpSecretsMu.Unlock()
 		http.Error(w, "secret expired, please try again", http.StatusBadRequest)
 		return
 	}
@@ -162,7 +200,9 @@ func (a *App) handleConfirmTOTP(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Mark as confirmed and clean up
+	totpSecretsMu.Lock()
 	delete(totpSecrets, secret)
+	totpSecretsMu.Unlock()
 
 	_ = a.insertOpAudit("security.totp.enable", "security", fmt.Sprintf("userId=%d", tempSecret.UserID), clientIP(r), r.UserAgent())
 
@@ -180,8 +220,7 @@ func (a *App) handleDisableTOTP(w http.ResponseWriter, r *http.Request) {
 	}
 
 	var req struct {
-		Code     string `json:"code"`
-		Password string `json:"password"` // Optional: require password confirmation
+		Code string `json:"code"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
@@ -271,7 +310,7 @@ func verifyTOTPCode(secret, code string) bool {
 	// Check current and adjacent time steps (allow 1 step drift for clock skew)
 	for i := -1; i <= 1; i++ {
 		expectedCode := generateTOTPCode(key, now+int64(i))
-		if subtleConstantTimeCompare(code, expectedCode) {
+		if subtle.ConstantTimeCompare([]byte(strings.TrimSpace(code)), []byte(expectedCode)) == 1 {
 			return true
 		}
 	}
@@ -312,14 +351,17 @@ func generateTOTPCode(key []byte, timeStep int64) string {
 	return fmt.Sprintf("%06d", code)
 }
 
-// subtleConstantTimeCompare performs a constant-time comparison
-func subtleConstantTimeCompare(a, b string) bool {
-	if len(a) != len(b) {
-		return false
+// generateTOTP generates a TOTP code for tests/diagnostics using a specific time-step.
+func generateTOTP(secret string, timeStep int64) string {
+	secret = strings.ToUpper(strings.TrimSpace(secret))
+	if l := len(secret) % 8; l != 0 {
+		secret += strings.Repeat("=", 8-l)
 	}
-	a = strings.TrimSpace(a)
-	b = strings.TrimSpace(b)
-	return bytes.Equal([]byte(a), []byte(b))
+	key, err := base32.StdEncoding.DecodeString(secret)
+	if err != nil {
+		return ""
+	}
+	return generateTOTPCode(key, timeStep)
 }
 
 // generateTOTPURI generates a TOTP URI for QR code

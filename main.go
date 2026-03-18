@@ -254,29 +254,41 @@ func (a *App) newMux() *http.ServeMux {
 	mux.HandleFunc("/login", a.withIPAllowlist(a.handleLogin))
 	mux.HandleFunc("/logout", a.withIPAllowlist(a.withPageAuth(a.handleLogout)))
 	mux.HandleFunc("/healthz", a.handleHealth)
-	mux.HandleFunc("/api/providers", a.withIPAllowlist(a.withAuth(a.handleProviders)))
-	mux.HandleFunc("/api/providers/import", a.withIPAllowlist(a.withAuth(a.handleProvidersImport)))
-	mux.HandleFunc("/api/providers/import-cc", a.withIPAllowlist(a.withAuth(a.handleProvidersImportCCSwitch)))
-	mux.HandleFunc("/api/providers/import-cc/report", a.withIPAllowlist(a.withAuth(a.handleProvidersImportCCSwitchReport)))
-	mux.HandleFunc("/api/providers/export", a.withIPAllowlist(a.withAuth(a.handleProvidersExport)))
-	mux.HandleFunc("/api/providers/test", a.withIPAllowlist(a.withAuth(a.handleProviderTest)))
-	mux.HandleFunc("/api/providers/test-batch", a.withIPAllowlist(a.withAuth(a.handleProviderTestBatch)))
-	mux.HandleFunc("/api/providers/", a.withIPAllowlist(a.withAuth(a.handleProviderByID)))
-	mux.HandleFunc("/api/activate", a.withIPAllowlist(a.withAuth(a.handleActivate)))
-	mux.HandleFunc("/api/backups", a.withIPAllowlist(a.withAuth(a.handleBackups)))
-	mux.HandleFunc("/api/rollback", a.withIPAllowlist(a.withAuth(a.handleRollback)))
-	mux.HandleFunc("/api/meta", a.withIPAllowlist(a.withAuth(a.handleMeta)))
-	mux.HandleFunc("/api/login-audits", a.withIPAllowlist(a.withAuth(a.handleLoginAudits)))
-	mux.HandleFunc("/api/login-audits/export", a.withIPAllowlist(a.withAuth(a.handleLoginAuditsExport)))
-	mux.HandleFunc("/api/op-audits", a.withIPAllowlist(a.withAuth(a.handleOpAudits)))
-	mux.HandleFunc("/api/op-audits/export", a.withIPAllowlist(a.withAuth(a.handleOpAuditsExport)))
-	mux.HandleFunc("/api/audits/cleanup", a.withIPAllowlist(a.withAuth(a.handleAuditsCleanup)))
-	mux.HandleFunc("/api/audits/settings", a.withIPAllowlist(a.withAuth(a.handleAuditSettings)))
-	mux.HandleFunc("/api/metrics/dashboard", a.withIPAllowlist(a.withAuth(a.handleMetricsDashboard)))
-	mux.HandleFunc("/api/metrics/export", a.withIPAllowlist(a.withAuth(a.handleMetricsExport)))
-	mux.HandleFunc("/api/security/ip-allowlist", a.withIPAllowlist(a.withAuth(a.handleIPAllowlist)))
-	mux.HandleFunc("/api/security/ip-allowlist/", a.withIPAllowlist(a.withAuth(a.handleIPAllowlistByID)))
-	mux.HandleFunc("/api/security/settings", a.withIPAllowlist(a.withAuth(a.handleSecuritySettings)))
+	mux.HandleFunc("/api/providers", a.withIPAllowlist(a.withRBACMethodAuth(map[string]string{
+		http.MethodGet:  PermProvidersRead,
+		http.MethodPost: PermProvidersWrite,
+	}, a.handleProviders)))
+	mux.HandleFunc("/api/providers/import", a.withIPAllowlist(a.withRBACAuth(PermProvidersWrite, a.handleProvidersImport)))
+	mux.HandleFunc("/api/providers/import-cc", a.withIPAllowlist(a.withRBACAuth(PermProvidersWrite, a.handleProvidersImportCCSwitch)))
+	mux.HandleFunc("/api/providers/import-cc/report", a.withIPAllowlist(a.withRBACAuth(PermProvidersWrite, a.handleProvidersImportCCSwitchReport)))
+	mux.HandleFunc("/api/providers/export", a.withIPAllowlist(a.withRBACAuth(PermProvidersRead, a.handleProvidersExport)))
+	mux.HandleFunc("/api/providers/test", a.withIPAllowlist(a.withRBACAuth(PermProvidersRead, a.handleProviderTest)))
+	mux.HandleFunc("/api/providers/test-batch", a.withIPAllowlist(a.withRBACAuth(PermProvidersRead, a.handleProviderTestBatch)))
+	mux.HandleFunc("/api/providers/", a.withIPAllowlist(a.withRBACAuth(PermProvidersWrite, a.handleProviderByID)))
+	mux.HandleFunc("/api/activate", a.withIPAllowlist(a.withRBACAuth(PermActivate, a.handleActivate)))
+	mux.HandleFunc("/api/backups", a.withIPAllowlist(a.withRBACAuth(PermBackupsRead, a.handleBackups)))
+	mux.HandleFunc("/api/rollback", a.withIPAllowlist(a.withRBACAuth(PermRollback, a.handleRollback)))
+	mux.HandleFunc("/api/meta", a.withIPAllowlist(a.withRBACAuth(PermProvidersRead, a.handleMeta)))
+	mux.HandleFunc("/api/login-audits", a.withIPAllowlist(a.withRBACAuth(PermAuditRead, a.handleLoginAudits)))
+	mux.HandleFunc("/api/login-audits/export", a.withIPAllowlist(a.withRBACAuth(PermAuditRead, a.handleLoginAuditsExport)))
+	mux.HandleFunc("/api/op-audits", a.withIPAllowlist(a.withRBACAuth(PermAuditRead, a.handleOpAudits)))
+	mux.HandleFunc("/api/op-audits/export", a.withIPAllowlist(a.withRBACAuth(PermAuditRead, a.handleOpAuditsExport)))
+	mux.HandleFunc("/api/audits/cleanup", a.withIPAllowlist(a.withRBACAuth(PermAuditCleanup, a.handleAuditsCleanup)))
+	mux.HandleFunc("/api/audits/settings", a.withIPAllowlist(a.withRBACMethodAuth(map[string]string{
+		http.MethodGet:  PermAuditRead,
+		http.MethodPost: PermAuditCleanup,
+	}, a.handleAuditSettings)))
+	mux.HandleFunc("/api/metrics/dashboard", a.withIPAllowlist(a.withRBACAuth(PermMetricsRead, a.handleMetricsDashboard)))
+	mux.HandleFunc("/api/metrics/export", a.withIPAllowlist(a.withRBACAuth(PermMetricsRead, a.handleMetricsExport)))
+	mux.HandleFunc("/api/security/ip-allowlist", a.withIPAllowlist(a.withRBACMethodAuth(map[string]string{
+		http.MethodGet:  PermSecurityRead,
+		http.MethodPost: PermSecurityWrite,
+	}, a.handleIPAllowlist)))
+	mux.HandleFunc("/api/security/ip-allowlist/", a.withIPAllowlist(a.withRBACAuth(PermSecurityWrite, a.handleIPAllowlistByID)))
+	mux.HandleFunc("/api/security/settings", a.withIPAllowlist(a.withRBACMethodAuth(map[string]string{
+		http.MethodGet:  PermSecurityRead,
+		http.MethodPost: PermSecurityWrite,
+	}, a.handleSecuritySettings)))
 
 	// RBAC API routes
 	mux.HandleFunc("/api/auth/login", a.withIPAllowlist(a.handleUserLogin))
@@ -286,9 +298,9 @@ func (a *App) newMux() *http.ServeMux {
 	mux.HandleFunc("/api/users/update", a.withIPAllowlist(a.withRBACAuth(PermUsersWrite, a.handleUpdateUser)))
 	mux.HandleFunc("/api/users/delete", a.withIPAllowlist(a.withRBACAuth(PermUsersWrite, a.handleDeleteUser)))
 	mux.HandleFunc("/api/roles", a.withIPAllowlist(a.withRBACAuth(PermUsersRead, a.handleListRoles)))
-	mux.HandleFunc("/api/totp/enable", a.withIPAllowlist(a.handleEnableTOTP))
-	mux.HandleFunc("/api/totp/confirm", a.withIPAllowlist(a.handleConfirmTOTP))
-	mux.HandleFunc("/api/totp/disable", a.withIPAllowlist(a.handleDisableTOTP))
+	mux.HandleFunc("/api/totp/enable", a.withIPAllowlist(a.withRBACAuth("", a.handleEnableTOTP)))
+	mux.HandleFunc("/api/totp/confirm", a.withIPAllowlist(a.withRBACAuth("", a.handleConfirmTOTP)))
+	mux.HandleFunc("/api/totp/disable", a.withIPAllowlist(a.withRBACAuth("", a.handleDisableTOTP)))
 
 	return mux
 }
@@ -498,6 +510,15 @@ func (a *App) clearFailures(ip string) {
 	a.mu.Lock()
 	delete(a.failed, ip)
 	a.mu.Unlock()
+}
+
+// Backward-compatible wrappers (used by older tests/docs).
+func (a *App) recordFailedAttempt(ip string) {
+	_, _ = a.recordFailure(ip)
+}
+
+func (a *App) clearFailedAttempts(ip string) {
+	a.clearFailures(ip)
 }
 
 func (a *App) handleHealth(w http.ResponseWriter, r *http.Request) {

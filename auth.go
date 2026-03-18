@@ -2,7 +2,6 @@ package main
 
 import (
 	"encoding/json"
-	"fmt"
 	"net"
 	"net/http"
 	"strings"
@@ -79,23 +78,6 @@ func (a *App) realClientIP(r *http.Request) string {
 }
 
 // getRealIP is defined in security.go
-
-func parseRemoteAddrIP(remoteAddr string) net.IP {
-	remoteAddr = strings.TrimSpace(remoteAddr)
-	if remoteAddr == "" {
-		return nil
-	}
-	h, _, err := net.SplitHostPort(remoteAddr)
-	if err == nil {
-		if ip := net.ParseIP(strings.TrimSpace(h)); ip != nil {
-			return ip
-		}
-	}
-	if ip := net.ParseIP(remoteAddr); ip != nil {
-		return ip
-	}
-	return nil
-}
 
 func parseXFF(xff string) []net.IP {
 	xff = strings.TrimSpace(xff)

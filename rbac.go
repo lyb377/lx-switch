@@ -109,6 +109,25 @@ var builtInRolePermissions = map[string][]string{
 	},
 }
 
+func hashPassword(password string) (string, error) {
+	password = strings.TrimSpace(password)
+	if password == "" {
+		return "", errors.New("password required")
+	}
+	b, err := bcrypt.GenerateFromPassword([]byte(password), bcrypt.DefaultCost)
+	if err != nil {
+		return "", err
+	}
+	return string(b), nil
+}
+
+func verifyPassword(hash string, password string) bool {
+	if strings.TrimSpace(hash) == "" || strings.TrimSpace(password) == "" {
+		return false
+	}
+	return bcrypt.CompareHashAndPassword([]byte(hash), []byte(password)) == nil
+}
+
 // initRBACSchema initializes the RBAC database tables
 func (a *App) initRBACSchema() error {
 	schema := `
@@ -224,14 +243,14 @@ func (a *App) initDefaultAdmin() error {
 
 	// Create default admin with the admin token as password
 	now := time.Now().Format(time.RFC3339)
-	passwordHash, err := bcrypt.GenerateFromPassword([]byte(a.adminToken), bcrypt.DefaultCost)
+	passwordHash, err := hashPassword(a.adminToken)
 	if err != nil {
 		return err
 	}
 
 	_, err = a.db.Exec(
 		`INSERT INTO users(username, email, password_hash, role_id, enabled, created_at, updated_at) VALUES(?, ?, ?, 1, 1, ?, ?)`,
-		"admin", "admin@localhost", string(passwordHash), now, now,
+		"admin", "admin@localhost", passwordHash, now, now,
 	)
 	return err
 }
@@ -259,6 +278,39 @@ func (a *App) withRBACAuth(permission string, next http.HandlerFunc) http.Handle
 		}
 
 		// Store user ID in header for downstream handlers
+		r.Header.Set("X-User-ID", fmt.Sprint(userID))
+		next(w, r)
+	}
+}
+
+func (a *App) withRBACMethodAuth(methodPermissions map[string]string, next http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		userID, err := a.getUserIDFromRequest(r)
+		if err != nil {
+			w.WriteHeader(http.StatusUnauthorized)
+			_ = json.NewEncoder(w).Encode(map[string]string{"error": "unauthorized"})
+			return
+		}
+
+		method := r.Method
+		if method == http.MethodHead {
+			method = http.MethodGet
+		}
+		permission := strings.TrimSpace(methodPermissions[method])
+		if permission == "" {
+			permission = strings.TrimSpace(methodPermissions["*"])
+		}
+
+		if permission != "" {
+			ok, err := a.hasPermission(userID, permission)
+			if err != nil || !ok {
+				_ = a.insertOpAudit("rbac.denied", "permission", fmt.Sprintf("userId=%d permission=%s method=%s path=%s", userID, permission, r.Method, r.URL.Path), clientIP(r), r.UserAgent())
+				w.WriteHeader(http.StatusForbidden)
+				_ = json.NewEncoder(w).Encode(map[string]string{"error": "forbidden"})
+				return
+			}
+		}
+
 		r.Header.Set("X-User-ID", fmt.Sprint(userID))
 		next(w, r)
 	}
@@ -446,7 +498,7 @@ func (a *App) handleUserLogin(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Verify password
-	if bcrypt.CompareHashAndPassword([]byte(user.PasswordHash), []byte(req.Password)) != nil {
+	if !verifyPassword(user.PasswordHash, req.Password) {
 		a.recordFailure(ip)
 		_ = a.insertLoginAudit(ip, ua, false, "invalid_credentials")
 		w.WriteHeader(http.StatusUnauthorized)
@@ -647,7 +699,7 @@ func (a *App) handleCreateUser(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Hash password
-	passwordHash, err := bcrypt.GenerateFromPassword([]byte(password), bcrypt.DefaultCost)
+	passwordHash, err := hashPassword(password)
 	if err != nil {
 		w.WriteHeader(http.StatusInternalServerError)
 		_ = json.NewEncoder(w).Encode(map[string]string{"error": "failed to hash password"})
@@ -657,7 +709,7 @@ func (a *App) handleCreateUser(w http.ResponseWriter, r *http.Request) {
 	now := time.Now().Format(time.RFC3339)
 	res, err := a.db.Exec(
 		`INSERT INTO users(username, email, password_hash, role_id, enabled, created_at, updated_at) VALUES(?, ?, ?, ?, 1, ?, ?)`,
-		username, req.Email, string(passwordHash), req.RoleID, now, now,
+		username, req.Email, passwordHash, req.RoleID, now, now,
 	)
 	if err != nil {
 		w.WriteHeader(http.StatusInternalServerError)
@@ -715,14 +767,14 @@ func (a *App) handleUpdateUser(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if req.Password != nil && *req.Password != "" {
-		passwordHash, err := bcrypt.GenerateFromPassword([]byte(*req.Password), bcrypt.DefaultCost)
+		passwordHash, err := hashPassword(*req.Password)
 		if err != nil {
 			w.WriteHeader(http.StatusInternalServerError)
 			_ = json.NewEncoder(w).Encode(map[string]string{"error": "failed to hash password"})
 			return
 		}
 		updates = append(updates, "password_hash = ?")
-		args = append(args, string(passwordHash))
+		args = append(args, passwordHash)
 	}
 
 	if req.RoleID != nil {
