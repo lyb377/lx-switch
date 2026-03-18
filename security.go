@@ -37,17 +37,32 @@ var allowlistCache ipAllowlistCache
 
 // loadSecuritySettings loads security settings and IP allowlist into memory
 func (a *App) loadSecuritySettings() {
+	var enabledLoaded *bool
+	var trustedLoaded []string
+
 	// Load IP allowlist enabled status from database
 	if v, err := a.getState("ip_allowlist_enabled"); err == nil && v != "" {
-		a.ipAllowlistEnabled = v == "1" || v == "true"
+		enabled := v == "1" || v == "true"
+		enabledLoaded = &enabled
 	}
 
 	// Load trusted proxies from database
 	if v, err := a.getState("trusted_proxies"); err == nil && v != "" {
 		var proxies []string
 		if err := json.Unmarshal([]byte(v), &proxies); err == nil {
-			a.trustedProxies = proxies
+			trustedLoaded = proxies
 		}
+	}
+
+	if enabledLoaded != nil || trustedLoaded != nil {
+		a.settingsMu.Lock()
+		if enabledLoaded != nil {
+			a.ipAllowlistEnabled = *enabledLoaded
+		}
+		if trustedLoaded != nil {
+			a.trustedProxies = trustedLoaded
+		}
+		a.settingsMu.Unlock()
 	}
 
 	// Load IP allowlist entries
@@ -77,6 +92,14 @@ func getRealIP(r *http.Request, trustedProxies []string) string {
 	if !isIPInCIDRList(remoteNetIP, trustedProxies) {
 		// Not a trusted proxy, return RemoteAddr directly
 		return remoteIP
+	}
+
+	// Cloudflare: when configured, CF-Connecting-IP is the original client IP.
+	cfConnectingIP := strings.TrimSpace(r.Header.Get("CF-Connecting-IP"))
+	if cfConnectingIP != "" {
+		if parsedIP := net.ParseIP(cfConnectingIP); parsedIP != nil {
+			return parsedIP.String()
+		}
 	}
 
 	// Get real IP from X-Forwarded-For chain
@@ -155,14 +178,19 @@ func isIPInCIDR(ip net.IP, cidr string) bool {
 // withIPAllowlist is a middleware that checks if the client IP is in the allowlist
 func (a *App) withIPAllowlist(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
+		a.settingsMu.RLock()
+		enabled := a.ipAllowlistEnabled
+		trusted := a.trustedProxies
+		a.settingsMu.RUnlock()
+
 		// Skip if IP allowlist is disabled
-		if !a.ipAllowlistEnabled {
+		if !enabled {
 			next(w, r)
 			return
 		}
 
 		// Get real IP
-		realIP := getRealIP(r, a.trustedProxies)
+		realIP := getRealIP(r, trusted)
 		if realIP == "" {
 			http.Error(w, "cannot determine client IP", http.StatusForbidden)
 			return
