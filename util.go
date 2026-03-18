@@ -87,17 +87,4 @@ func parseDatePrefixRFC3339(raw string, end bool) string {
 	return ""
 }
 
-func parseCommaList(raw string) []string {
-	if strings.TrimSpace(raw) == "" {
-		return []string{}
-	}
-	parts := strings.Split(raw, ",")
-	var out []string
-	for _, p := range parts {
-		p = strings.TrimSpace(p)
-		if p != "" {
-			out = append(out, p)
-		}
-	}
-	return out
-}
+// parseCommaList is defined in main.go

@@ -280,7 +280,13 @@ func verifyTOTPCode(secret, code string) bool {
 }
 
 // verifyTOTP is an alias for verifyTOTPCode (for backward compatibility)
-func (a *App) verifyTOTP(secret, code string) bool {
+// This is a package-level function, not a method
+func verifyTOTP(secret, code string) bool {
+	return verifyTOTPCode(secret, code)
+}
+
+// VerifyTOTP is the method version for App
+func (a *App) VerifyTOTP(secret, code string) bool {
 	return verifyTOTPCode(secret, code)
 }
 

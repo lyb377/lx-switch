@@ -61,6 +61,7 @@ func (a *App) loadSecuritySettings() {
 }
 
 // getRealIP gets the real client IP, supporting X-Forwarded-For trust chain
+// This correctly walks backwards through the XFF chain to find the first non-trusted proxy IP
 func getRealIP(r *http.Request, trustedProxies []string) string {
 	remoteIP, _, err := net.SplitHostPort(strings.TrimSpace(r.RemoteAddr))
 	if err != nil {
@@ -73,25 +74,37 @@ func getRealIP(r *http.Request, trustedProxies []string) string {
 	}
 
 	// Check if RemoteAddr is in trusted proxy list
-	isTrustedProxy := false
-	for _, proxy := range trustedProxies {
-		if isIPInCIDR(remoteNetIP, proxy) {
-			isTrustedProxy = true
-			break
-		}
-	}
-
-	// If not a trusted proxy, return RemoteAddr directly
-	if !isTrustedProxy {
+	if !isIPInCIDRList(remoteNetIP, trustedProxies) {
+		// Not a trusted proxy, return RemoteAddr directly
 		return remoteIP
 	}
 
-	// Get real IP from X-Forwarded-For
+	// Get real IP from X-Forwarded-For chain
+	// XFF format: client, proxy1, proxy2, ... (leftmost is original client)
 	xff := r.Header.Get("X-Forwarded-For")
 	if xff != "" {
 		ips := strings.Split(xff, ",")
+		// Walk backwards from rightmost (most recent) to find first non-trusted IP
+		for i := len(ips) - 1; i >= 0; i-- {
+			ip := strings.TrimSpace(ips[i])
+			if ip == "" {
+				continue
+			}
+			parsedIP := net.ParseIP(ip)
+			if parsedIP == nil {
+				continue
+			}
+			// If this IP is not in trusted proxies, it's the real client IP
+			if !isIPInCIDRList(parsedIP, trustedProxies) {
+				return parsedIP.String()
+			}
+		}
+		// All IPs in chain are trusted, return the leftmost (original client)
 		for _, ip := range ips {
 			ip = strings.TrimSpace(ip)
+			if ip == "" {
+				continue
+			}
 			if parsedIP := net.ParseIP(ip); parsedIP != nil {
 				return parsedIP.String()
 			}
@@ -107,6 +120,20 @@ func getRealIP(r *http.Request, trustedProxies []string) string {
 	}
 
 	return remoteIP
+}
+
+// isIPInCIDRList checks if an IP is in a list of CIDR ranges or exact IPs
+func isIPInCIDRList(ip net.IP, list []string) bool {
+	for _, cidr := range list {
+		cidr = strings.TrimSpace(cidr)
+		if cidr == "" {
+			continue
+		}
+		if isIPInCIDR(ip, cidr) {
+			return true
+		}
+	}
+	return false
 }
 
 // isIPInCIDR checks if an IP is in a CIDR range

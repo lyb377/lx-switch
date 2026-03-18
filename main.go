@@ -246,7 +246,10 @@ func newAppFromEnv() (*App, string, error) {
 
 func (a *App) newMux() *http.ServeMux {
 	mux := http.NewServeMux()
+	// Static files (Vite build output)
 	mux.Handle("/static/", http.StripPrefix("/static/", http.FileServer(http.Dir("web/static"))))
+	// Source files for Vite dev mode
+	mux.Handle("/src/", http.StripPrefix("/src/", http.FileServer(http.Dir("web/src"))))
 	mux.HandleFunc("/", a.withIPAllowlist(a.withPageAuth(a.handleIndex)))
 	mux.HandleFunc("/login", a.withIPAllowlist(a.handleLogin))
 	mux.HandleFunc("/logout", a.withIPAllowlist(a.withPageAuth(a.handleLogout)))
@@ -715,39 +718,6 @@ func (a *App) handleAuditSettings(w http.ResponseWriter, r *http.Request) {
 	default:
 		w.WriteHeader(http.StatusMethodNotAllowed)
 	}
-}
-
-func (a *App) handleMetricsSummary(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodGet {
-		w.WriteHeader(http.StatusMethodNotAllowed)
-		return
-	}
-
-	window := strings.TrimSpace(r.URL.Query().Get("window"))
-	if window == "" {
-		window = "24h"
-	}
-
-	var duration string
-	switch window {
-	case "24h":
-		duration = "-1 day"
-	case "7d":
-		duration = "-7 days"
-	case "30d":
-		duration = "-30 days"
-	default:
-		http.Error(w, "invalid window, must be 24h|7d|30d", 400)
-		return
-	}
-
-	summary, err := a.getMetricsSummary(duration, window)
-	if err != nil {
-		http.Error(w, err.Error(), 500)
-		return
-	}
-
-	_ = json.NewEncoder(w).Encode(summary)
 }
 
 func (a *App) handleProviders(w http.ResponseWriter, r *http.Request) {

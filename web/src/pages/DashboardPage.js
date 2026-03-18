@@ -55,7 +55,7 @@ function switchWindow(window) {
  */
 async function loadMetrics() {
   try {
-    const data = await api(`/api/metrics/summary?window=${currentWindow}`);
+    const data = await api.get(`/api/metrics/dashboard?window=${currentWindow}`);
     renderMetrics(data);
   } catch (err) {
     showToast('加载指标失败: ' + err.message, 'error');
