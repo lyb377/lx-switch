@@ -14,6 +14,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"image/png"
+	"log"
 	"net/http"
 	"strings"
 	"sync"
@@ -347,7 +348,7 @@ func (a *App) handleDisableTOTP(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Disable TOTP
-	_, err = a.db.Exec(`
+	result, err := a.db.Exec(`
 		UPDATE users SET totp_enabled = 0, totp_secret = '', updated_at = ? WHERE id = ?`,
 		time.Now().Format(time.RFC3339), userID,
 	)
@@ -355,8 +356,21 @@ func (a *App) handleDisableTOTP(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "failed to disable TOTP", http.StatusInternalServerError)
 		return
 	}
+	rowsAffected, _ := result.RowsAffected()
+	if rowsAffected == 0 {
+		http.Error(w, "user not found", http.StatusNotFound)
+		return
+	}
 
-	_, _ = a.db.Exec(`DELETE FROM totp_recovery_codes WHERE user_id = ?`, userID)
+	// Delete recovery codes
+	if _, err := a.db.Exec(`DELETE FROM totp_recovery_codes WHERE user_id = ?`, userID); err != nil {
+		log.Printf("warning: failed to delete recovery codes: %v", err)
+	}
+
+	// Clear all user sessions (force re-login after disabling 2FA for security)
+	if err := a.clearUserSessions(userID); err != nil {
+		log.Printf("warning: failed to clear user sessions after TOTP disable: %v", err)
+	}
 
 	_ = a.insertOpAudit("security.totp.disable", "security", fmt.Sprintf("userId=%d", userID), clientIP(r), r.UserAgent())
 

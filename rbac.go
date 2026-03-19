@@ -353,6 +353,16 @@ func (a *App) validateSession(sessionID string) (int64, error) {
 	s, ok := sessions[sessionID]
 	sessionsMu.RUnlock()
 	if ok && time.Now().Before(s.ExpiresAt) {
+		// Verify session still exists in database (handles cases where DB session was deleted)
+		var dbUserID int64
+		err := a.db.QueryRow(`SELECT user_id FROM sessions WHERE id = ?`, sessionID).Scan(&dbUserID)
+		if err != nil {
+			// Session was deleted from DB, remove from memory cache
+			sessionsMu.Lock()
+			delete(sessions, sessionID)
+			sessionsMu.Unlock()
+			return 0, errors.New("session invalidated")
+		}
 		return s.UserID, nil
 	}
 
@@ -372,6 +382,22 @@ func (a *App) validateSession(sessionID string) (int64, error) {
 	}
 
 	return userID, nil
+}
+
+// clearUserSessions removes all sessions for a user from both memory and database
+func (a *App) clearUserSessions(userID int64) error {
+	// Clear memory sessions
+	sessionsMu.Lock()
+	for id, s := range sessions {
+		if s.UserID == userID {
+			delete(sessions, id)
+		}
+	}
+	sessionsMu.Unlock()
+
+	// Clear database sessions
+	_, err := a.db.Exec(`DELETE FROM sessions WHERE user_id = ?`, userID)
+	return err
 }
 
 // getUserByID retrieves a user by ID
@@ -865,14 +891,22 @@ func (a *App) handleDeleteUser(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	// Delete user's sessions
-	_, _ = a.db.Exec(`DELETE FROM sessions WHERE user_id = ?`, req.ID)
+	// Delete user's sessions (both memory and database)
+	if err := a.clearUserSessions(req.ID); err != nil {
+		log.Printf("warning: failed to clear user sessions: %v", err)
+	}
 
 	// Delete user
-	_, err = a.db.Exec(`DELETE FROM users WHERE id = ?`, req.ID)
+	result, err := a.db.Exec(`DELETE FROM users WHERE id = ?`, req.ID)
 	if err != nil {
 		w.WriteHeader(http.StatusInternalServerError)
 		_ = json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+		return
+	}
+	rowsAffected, _ := result.RowsAffected()
+	if rowsAffected == 0 {
+		w.WriteHeader(http.StatusNotFound)
+		_ = json.NewEncoder(w).Encode(map[string]string{"error": "user not found"})
 		return
 	}
 
