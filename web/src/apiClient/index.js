@@ -141,6 +141,13 @@ export async function downloadBlob(url, data = null) {
 // ==================== API 端点 ====================
 
 export const api = {
+  // Generic methods
+  get,
+  post,
+  put,
+  del,
+  request,
+
   // Meta
   getMeta: () => get('/api/meta'),
 

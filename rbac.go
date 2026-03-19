@@ -176,6 +176,18 @@ func (a *App) initRBACSchema() error {
 	);
 	CREATE INDEX IF NOT EXISTS idx_sessions_user ON sessions(user_id);
 	CREATE INDEX IF NOT EXISTS idx_sessions_expires ON sessions(expires_at);
+
+	-- TOTP recovery codes table
+	CREATE TABLE IF NOT EXISTS totp_recovery_codes (
+		id INTEGER PRIMARY KEY AUTOINCREMENT,
+		user_id INTEGER NOT NULL,
+		code_hash TEXT NOT NULL,
+		created_at TEXT NOT NULL,
+		used_at TEXT DEFAULT NULL,
+		FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+	);
+	CREATE INDEX IF NOT EXISTS idx_totp_recovery_codes_user ON totp_recovery_codes(user_id);
+	CREATE INDEX IF NOT EXISTS idx_totp_recovery_codes_hash ON totp_recovery_codes(code_hash);
 	`
 
 	_, err := a.db.Exec(schema)
@@ -484,9 +496,10 @@ func (a *App) handleUserLogin(w http.ResponseWriter, r *http.Request) {
 	}
 
 	var req struct {
-		Username string `json:"username"`
-		Password string `json:"password"`
-		TotpCode string `json:"totpCode,omitempty"`
+		Username     string `json:"username"`
+		Password     string `json:"password"`
+		TotpCode     string `json:"totpCode,omitempty"`
+		RecoveryCode string `json:"recoveryCode,omitempty"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		w.WriteHeader(http.StatusBadRequest)
@@ -534,13 +547,30 @@ func (a *App) handleUserLogin(w http.ResponseWriter, r *http.Request) {
 
 	// Check 2FA if enabled
 	if user.TOTPEnabled {
-		if req.TotpCode == "" {
+		if req.TotpCode == "" && req.RecoveryCode == "" {
 			w.WriteHeader(http.StatusUnauthorized)
-			_ = json.NewEncoder(w).Encode(map[string]string{"error": "totp_required", "message": "2FA code required"})
+			_ = json.NewEncoder(w).Encode(map[string]string{"error": "totp_required", "message": "2FA code or recovery code required"})
 			return
 		}
 
-		if !verifyTOTP(user.TotpSecret, req.TotpCode) {
+		// Try TOTP code first
+		totpValid := false
+		if req.TotpCode != "" {
+			totpValid = verifyTOTP(user.TotpSecret, req.TotpCode)
+		}
+
+		// If TOTP failed, try recovery code
+		if !totpValid && req.RecoveryCode != "" {
+			used, err := a.consumeRecoveryCode(user.ID, req.RecoveryCode)
+			if err != nil || !used {
+				a.recordFailure(ip)
+				_ = a.insertLoginAudit(ip, ua, false, "invalid_totp_or_recovery")
+				w.WriteHeader(http.StatusUnauthorized)
+				_ = json.NewEncoder(w).Encode(map[string]string{"error": "invalid 2FA code or recovery code"})
+				return
+			}
+			// Recovery code used successfully, continue with login
+		} else if !totpValid {
 			a.recordFailure(ip)
 			_ = a.insertLoginAudit(ip, ua, false, "invalid_totp")
 			w.WriteHeader(http.StatusUnauthorized)
