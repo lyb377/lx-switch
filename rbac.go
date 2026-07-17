@@ -350,7 +350,7 @@ func (a *App) getUserIDFromRequest(r *http.Request) (int64, error) {
 		}
 	}
 
-	if token == a.adminToken {
+	if token != "" && secureCompare(token, a.adminToken) {
 		// Legacy token mode: return admin user ID (ID 1)
 		return 1, nil
 	}

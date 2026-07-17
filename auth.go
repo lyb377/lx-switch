@@ -18,7 +18,7 @@ func (a *App) withAuth(next http.HandlerFunc) http.HandlerFunc {
 				t = c.Value
 			}
 		}
-		if t != a.adminToken {
+		if !secureCompare(t, a.adminToken) {
 			w.WriteHeader(http.StatusUnauthorized)
 			_ = json.NewEncoder(w).Encode(map[string]string{"error": "unauthorized"})
 			return
@@ -30,7 +30,7 @@ func (a *App) withAuth(next http.HandlerFunc) http.HandlerFunc {
 func (a *App) withPageAuth(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		c, err := r.Cookie("lx_token")
-		if err != nil || c.Value != a.adminToken {
+		if err != nil || !secureCompare(c.Value, a.adminToken) {
 			http.Redirect(w, r, "/login", http.StatusFound)
 			return
 		}
