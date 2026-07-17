@@ -1,11 +1,38 @@
 package main
 
 import (
+	"database/sql"
 	"net"
 	"net/http"
+	"net/http/httptest"
 	"testing"
 	"time"
 )
+
+func newTestAppRBAC(t *testing.T) *App {
+	t.Helper()
+	db, err := sql.Open("sqlite3", ":memory:")
+	if err != nil {
+		t.Fatalf("open db: %v", err)
+	}
+	db.SetMaxOpenConns(1)
+	app := &App{
+		db:         db,
+		adminToken: "test-admin-token",
+		failed:     map[string]*attemptState{},
+		maxAttempts: 3,
+		window:      5 * time.Minute,
+		lockout:     15 * time.Minute,
+	}
+	if err := app.initDB(); err != nil {
+		t.Fatalf("initDB: %v", err)
+	}
+	if err := app.initRBACSchema(); err != nil {
+		t.Fatalf("initRBACSchema: %v", err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+	return app
+}
 
 // Test IP allowlist functions
 func TestIPInCIDRList(t *testing.T) {
@@ -288,6 +315,131 @@ func TestGenerateTOTPURI(t *testing.T) {
 	}
 }
 
+func TestVerifyTOTPCode_RoundTrip(t *testing.T) {
+	secret := "JBSWY3DPEHPK3PXP"
+	nowStep := time.Now().Unix() / 30
+	code := generateTOTP(secret, nowStep)
+	if code == "" {
+		t.Fatalf("generateTOTP() returned empty code")
+	}
+	if !verifyTOTPCode(secret, code) {
+		t.Fatalf("verifyTOTPCode() = false, want true")
+	}
+}
+
+func TestWithIPAllowlistMiddleware_AllowDeny(t *testing.T) {
+	app := newTestApp(t)
+
+	// Ensure clean cache for this test.
+	allowlistCache.mu.Lock()
+	allowlistCache.entries = nil
+	allowlistCache.mu.Unlock()
+	t.Cleanup(func() {
+		allowlistCache.mu.Lock()
+		allowlistCache.entries = nil
+		allowlistCache.mu.Unlock()
+	})
+
+	now := time.Now().Format(time.RFC3339)
+	_, err := app.db.Exec(`INSERT INTO ip_allowlist(ip_cidr, description, enabled, created_at) VALUES(?, '', 1, ?)`, "192.0.2.0/24", now)
+	if err != nil {
+		t.Fatalf("seed ip_allowlist: %v", err)
+	}
+	_ = app.setState("ip_allowlist_enabled", "true")
+	app.loadSecuritySettings()
+
+	called := false
+	okHandler := app.withIPAllowlist(func(w http.ResponseWriter, r *http.Request) {
+		called = true
+		w.WriteHeader(http.StatusOK)
+	})
+
+	// Allowed
+	{
+		called = false
+		rr := httptest.NewRecorder()
+		req := httptest.NewRequest(http.MethodGet, "/api/meta", nil)
+		req.RemoteAddr = "192.0.2.10:12345"
+		okHandler(rr, req)
+		if rr.Code != http.StatusOK || !called {
+			t.Fatalf("allowed request: code=%d called=%v", rr.Code, called)
+		}
+	}
+
+	// Denied
+	{
+		called = false
+		rr := httptest.NewRecorder()
+		req := httptest.NewRequest(http.MethodGet, "/api/meta", nil)
+		req.RemoteAddr = "203.0.113.1:12345"
+		okHandler(rr, req)
+		if rr.Code != http.StatusForbidden || called {
+			t.Fatalf("denied request: code=%d called=%v", rr.Code, called)
+		}
+	}
+}
+
+func TestTOTPRecoveryCodes_ConsumeOnce(t *testing.T) {
+	app := newTestAppRBAC(t)
+	admin, err := app.getUserByUsername("admin")
+	if err != nil {
+		t.Fatalf("getUserByUsername(admin): %v", err)
+	}
+	codes, err := app.replaceRecoveryCodes(admin.ID)
+	if err != nil {
+		t.Fatalf("replaceRecoveryCodes: %v", err)
+	}
+	if len(codes) != 8 {
+		t.Fatalf("expected 8 recovery codes, got %d", len(codes))
+	}
+	ok, err := app.consumeRecoveryCode(admin.ID, codes[0])
+	if err != nil {
+		t.Fatalf("consumeRecoveryCode: %v", err)
+	}
+	if !ok {
+		t.Fatalf("expected first consume ok=true")
+	}
+	ok, err = app.consumeRecoveryCode(admin.ID, codes[0])
+	if err != nil {
+		t.Fatalf("consumeRecoveryCode second: %v", err)
+	}
+	if ok {
+		t.Fatalf("expected second consume ok=false")
+	}
+}
+
+func TestHasPermission_AdminVsViewer(t *testing.T) {
+	app := newTestAppRBAC(t)
+
+	var adminID int64
+	if err := app.db.QueryRow(`SELECT id FROM users WHERE username = ?`, "admin").Scan(&adminID); err != nil {
+		t.Fatalf("lookup admin: %v", err)
+	}
+
+	ok, err := app.hasPermission(adminID, PermUsersWrite)
+	if err != nil || !ok {
+		t.Fatalf("admin should have %s, ok=%v err=%v", PermUsersWrite, ok, err)
+	}
+
+	viewerHash, err := hashPassword("viewer-pass")
+	if err != nil {
+		t.Fatalf("hashPassword: %v", err)
+	}
+	now := time.Now().Format(time.RFC3339)
+	res, err := app.db.Exec(`INSERT INTO users(username, email, password_hash, role_id, enabled, created_at, updated_at) VALUES(?, ?, ?, ?, 1, ?, ?)`,
+		"viewer", "viewer@localhost", viewerHash, 4, now, now,
+	)
+	if err != nil {
+		t.Fatalf("create viewer: %v", err)
+	}
+	viewerID, _ := res.LastInsertId()
+
+	ok, err = app.hasPermission(viewerID, PermUsersWrite)
+	if err == nil && ok {
+		t.Fatalf("viewer should not have %s", PermUsersWrite)
+	}
+}
+
 // Test rate limiting
 func TestAttemptState(t *testing.T) {
 	app := &App{
@@ -300,24 +452,27 @@ func TestAttemptState(t *testing.T) {
 	ip := "192.0.2.1"
 
 	// First attempt
-	app.recordFailedAttempt(ip)
+	_, _ = app.recordFailure(ip)
 	wait, blocked := app.isBlocked(ip)
 	if blocked {
 		t.Error("isBlocked() = true after 1 attempt, want false")
 	}
 
 	// Second attempt
-	app.recordFailedAttempt(ip)
+	_, _ = app.recordFailure(ip)
 	wait, blocked = app.isBlocked(ip)
 	if blocked {
 		t.Error("isBlocked() = true after 2 attempts, want false")
 	}
 
 	// Third attempt (should trigger lockout)
-	app.recordFailedAttempt(ip)
+	retryAfterS, locked := app.recordFailure(ip)
 	wait, blocked = app.isBlocked(ip)
 	if !blocked {
 		t.Error("isBlocked() = false after 3 attempts, want true")
+	}
+	if !locked || retryAfterS <= 0 {
+		t.Errorf("recordFailure() = (retryAfterS=%d locked=%v), want locked with retryAfterS>0", retryAfterS, locked)
 	}
 
 	if wait <= 0 {
@@ -325,9 +480,9 @@ func TestAttemptState(t *testing.T) {
 	}
 
 	// Clear attempts
-	app.clearFailedAttempts(ip)
+	app.clearFailures(ip)
 	wait, blocked = app.isBlocked(ip)
 	if blocked {
-		t.Error("isBlocked() = true after clearFailedAttempts(), want false")
+		t.Error("isBlocked() = true after clearFailures(), want false")
 	}
 }

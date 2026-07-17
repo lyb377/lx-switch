@@ -6,7 +6,31 @@
 
 1. Header：`X-Admin-Token: <token>`
 2. Query：`?token=<token>`
-3. 登录后 Cookie（页面会话）
+3. 登录后 Cookie（页面会话）：`lx_token`（旧版）
+4. RBAC 登录后 Cookie：`lx_session`（新版多用户会话）
+
+说明：
+- **401**：未登录/未提供有效凭证
+- **403**：已登录但缺少权限点（RBAC）
+
+### POST /api/auth/login（RBAC）
+
+Body:
+```json
+{
+  "username": "admin",
+  "password": "your-password",
+  "totpCode": "123456",
+  "recoveryCode": "xxxxxx"
+}
+```
+
+成功后会设置 `lx_session` cookie（HttpOnly）。
+说明：当用户启用 2FA 时，`totpCode` 与 `recoveryCode` 需二选一提供。
+
+### POST /api/auth/logout（RBAC）
+
+清理 `lx_session`（服务端会话 + cookie）。
 
 ---
 
@@ -284,10 +308,87 @@ Response:
 
 ---
 
+## Security（IP allowlist）
+
+### GET /api/security/settings
+
+读取安全设置：
+- `ipAllowlistEnabled`
+- `trustedProxies`（CIDR/IP 列表）
+
+### POST /api/security/settings
+
+更新安全设置。
+
+### GET /api/security/ip-allowlist
+
+列出 allowlist 条目。
+
+### POST /api/security/ip-allowlist
+
+新增 allowlist 条目。
+
+Body:
+```json
+{ "ipCidr": "192.0.2.0/24", "description": "office", "enabled": true }
+```
+
+### PUT /api/security/ip-allowlist/{id}
+
+更新 allowlist 条目。
+
+### DELETE /api/security/ip-allowlist/{id}
+
+删除 allowlist 条目。
+
+---
+
+## RBAC（用户/角色/2FA）
+
+### GET /api/users
+### POST /api/users/create
+### POST /api/users/update
+### POST /api/users/delete
+
+用户管理（需要 `users:read/users:write`）。
+
+### GET /api/roles
+
+列出内置角色与权限集合。
+
+### POST /api/totp/enable
+### POST /api/totp/confirm
+### POST /api/totp/disable
+
+当前登录用户绑定/确认/关闭 TOTP（confirm 成功后会返回一次性展示的 recoveryCodes）。
+
+### POST /api/totp/recovery/regenerate
+
+为当前用户重新生成恢复码（需要提供当前 `code`，恢复码不能用于再生成）。
+
+### POST /api/totp/admin-disable
+
+管理员恢复路径：为指定用户关闭 TOTP（需要 `users:write`，会同时清理恢复码与会话）。
+
+Body:
+```json
+{ "userId": 2 }
+```
+
+---
+
+## Metrics
+
+- `GET /api/metrics/dashboard?window=24h|7d|30d`
+- `GET /api/metrics/export?window=24h|7d|30d&format=csv|json`
+
+---
+
 ## 错误语义（通用）
 
 - `400`：参数错误/校验失败
 - `401`：未授权
+- `403`：权限不足
 - `405`：方法不允许
 - `500`：服务内部错误
 
@@ -325,9 +426,11 @@ Request Body:
 {
   "username": "admin",
   "password": "password123",
-  "totpCode": "123456"  // 可选，启用 2FA 时必填
+  "totpCode": "123456",
+  "recoveryCode": "xxxxxx"
 }
 ```
+说明：当用户启用 2FA 时，`totpCode` 与 `recoveryCode` 需二选一提供。
 
 Response (成功):
 ```json
@@ -451,13 +554,16 @@ Response:
     "permissions": [
       "providers:read",
       "providers:write",
-      "activate",
-      "rollback",
-      "audits:read",
-      "audits:export",
-      "settings:write",
       "users:read",
       "users:write",
+      "audit:read",
+      "audit:cleanup",
+      "security:read",
+      "security:write",
+      "backups:read",
+      "backups:write",
+      "activate",
+      "rollback",
       "metrics:read"
     ],
     "createdAt": "2026-03-15T10:00:00Z"
@@ -468,9 +574,8 @@ Response:
     "description": "Built-in operator role",
     "permissions": [
       "providers:read",
-      "providers:write",
       "activate",
-      "audits:read",
+      "audit:read",
       "metrics:read"
     ],
     "createdAt": "2026-03-15T10:00:00Z"
@@ -481,7 +586,7 @@ Response:
     "description": "Built-in viewer role",
     "permissions": [
       "providers:read",
-      "audits:read",
+      "audit:read",
       "metrics:read"
     ],
     "createdAt": "2026-03-15T10:00:00Z"
@@ -500,12 +605,16 @@ Response:
 Response:
 ```json
 {
+  "success": true,
   "secret": "JBSWY3DPEHPK3PXP",
-  "uri": "otpauth://totp/lx-switch:admin?secret=JBSWY3DPEHPK3PXP&issuer=lx-switch"
+  "qrCodeUrl": "otpauth://totp/lx-switch:admin?secret=JBSWY3DPEHPK3PXP&issuer=lx-switch",
+  "qrCodeData": "data:image/png;base64,...",
+  "issuer": "lx-switch",
+  "account": "admin"
 }
 ```
 
-前端应将 `uri` 生成 QR 码供用户扫描。
+前端可直接展示 `qrCodeData`（PNG data URL），或用 `qrCodeUrl` 自行生成。
 
 ### POST /api/totp/confirm
 
@@ -514,6 +623,7 @@ Response:
 Request Body:
 ```json
 {
+  "secret": "JBSWY3DPEHPK3PXP",
   "code": "123456"
 }
 ```
@@ -521,9 +631,11 @@ Request Body:
 Response:
 ```json
 {
-  "success": true
+  "success": true,
+  "recoveryCodes": ["xxxxxx", "xxxxxx"]
 }
 ```
+说明：`recoveryCodes` 为一次性展示的恢复码（请立即离线保存）；后续可通过再生成接口刷新。
 
 错误码：
 - `400`: 2FA 未初始化
@@ -536,9 +648,12 @@ Response:
 Request Body:
 ```json
 {
-  "password": "current_password"
+  "code": "123456",
+  "recoveryCode": "xxxxxx",
+  "password": "optional_current_password"
 }
 ```
+说明：当启用 2FA 时，`code`（TOTP）与 `recoveryCode` 需二选一提供；`password` 为可选的二次确认。
 
 Response:
 ```json
@@ -547,8 +662,19 @@ Response:
 }
 ```
 
-错误码：
-- `401`: 密码错误
+### POST /api/totp/recovery/regenerate
+
+为当前用户重新生成恢复码（需要提供当前 TOTP code）。
+
+Request Body:
+```json
+{ "code": "123456" }
+```
+
+Response:
+```json
+{ "success": true, "recoveryCodes": ["xxxxxx", "xxxxxx"] }
+```
 
 ---
 
@@ -562,9 +688,12 @@ Response:
 | `providers:write` | 创建/编辑/删除 Provider |
 | `activate` | 激活 Provider |
 | `rollback` | 回滚配置 |
-| `audits:read` | 查看审计日志 |
-| `audits:export` | 导出审计日志 |
-| `settings:write` | 修改系统设置 |
+| `audit:read` | 查看审计日志（含导出） |
+| `audit:cleanup` | 清理审计/修改审计保留设置 |
+| `security:read` | 查看安全设置/allowlist |
+| `security:write` | 修改安全设置/allowlist |
+| `backups:read` | 查看备份列表 |
+| `backups:write` | 回滚/管理备份 |
 | `users:read` | 查看用户列表 |
 | `users:write` | 管理用户（创建/编辑/删除） |
 | `metrics:read` | 查看指标数据 |
@@ -587,7 +716,7 @@ Response:
 
 ### POST /api/security/settings
 
-更新安全设置（需要 `settings:write` 权限）。
+更新安全设置（需要 `security:write` 权限）。
 
 Request Body:
 ```json
@@ -599,7 +728,7 @@ Request Body:
 
 ### GET /api/security/ip-allowlist
 
-列出 IP 白名单条目（需要 `settings:write` 权限）。
+列出 IP 白名单条目（需要 `security:read` 权限）。
 
 Response:
 ```json
@@ -616,7 +745,7 @@ Response:
 
 ### POST /api/security/ip-allowlist
 
-添加 IP 白名单条目（需要 `settings:write` 权限）。
+添加 IP 白名单条目（需要 `security:write` 权限）。
 
 Request Body:
 ```json
@@ -629,11 +758,11 @@ Request Body:
 
 ### PUT /api/security/ip-allowlist/{id}
 
-更新 IP 白名单条目（需要 `settings:write` 权限）。
+更新 IP 白名单条目（需要 `security:write` 权限）。
 
 ### DELETE /api/security/ip-allowlist/{id}
 
-删除 IP 白名单条目（需要 `settings:write` 权限）。
+删除 IP 白名单条目（需要 `security:write` 权限）。
 
 ---
 

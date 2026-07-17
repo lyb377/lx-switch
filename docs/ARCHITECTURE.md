@@ -94,7 +94,7 @@
 
 3. **向后兼容**
    - 保留对 `LX_SWITCH_TOKEN` 的支持
-   - Legacy token 视为管理员权限（user_id = 1）
+   - Legacy token 视为内置管理员用户（username=`admin`）
 
 ### 4.5 IP 白名单流程（M4 新增）
 

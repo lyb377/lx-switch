@@ -256,11 +256,14 @@ func (a *App) handleIPAllowlist(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 			return
 		}
+		a.settingsMu.RLock()
+		enabled := a.ipAllowlistEnabled
+		a.settingsMu.RUnlock()
 		_ = json.NewEncoder(w).Encode(map[string]any{
 			"success": true,
 			"items":   entries,
 			"count":   len(entries),
-			"enabled": a.ipAllowlistEnabled,
+			"enabled": enabled,
 		})
 
 	case http.MethodPost:
@@ -443,10 +446,14 @@ func (a *App) handleIPAllowlistByID(w http.ResponseWriter, r *http.Request) {
 func (a *App) handleSecuritySettings(w http.ResponseWriter, r *http.Request) {
 	switch r.Method {
 	case http.MethodGet:
+		a.settingsMu.RLock()
+		enabled := a.ipAllowlistEnabled
+		trusted := a.trustedProxies
+		a.settingsMu.RUnlock()
 		_ = json.NewEncoder(w).Encode(map[string]any{
 			"success":            true,
-			"ipAllowlistEnabled": a.ipAllowlistEnabled,
-			"trustedProxies":     a.trustedProxies,
+			"ipAllowlistEnabled": enabled,
+			"trustedProxies":     trusted,
 		})
 
 	case http.MethodPost:
@@ -508,7 +515,9 @@ func (a *App) handleSecuritySettings(w http.ResponseWriter, r *http.Request) {
 				return
 			}
 
+			a.settingsMu.RLock()
 			proposedTrusted := a.trustedProxies
+			a.settingsMu.RUnlock()
 			if req.TrustedProxies != nil {
 				proposedTrusted = req.TrustedProxies
 			}
@@ -519,6 +528,7 @@ func (a *App) handleSecuritySettings(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 
+		a.settingsMu.Lock()
 		if req.IPAllowlistEnabled != nil {
 			a.ipAllowlistEnabled = *req.IPAllowlistEnabled
 			// Save to database
@@ -535,9 +545,12 @@ func (a *App) handleSecuritySettings(w http.ResponseWriter, r *http.Request) {
 			proxiesJSON, _ := json.Marshal(req.TrustedProxies)
 			_ = a.setState("trusted_proxies", string(proxiesJSON))
 		}
+		enabledNow := a.ipAllowlistEnabled
+		trustedNow := a.trustedProxies
+		a.settingsMu.Unlock()
 
 		_ = a.insertOpAudit("security.settings.update", "security",
-			fmt.Sprintf("ipAllowlistEnabled=%v trustedProxies=%v", a.ipAllowlistEnabled, a.trustedProxies),
+			fmt.Sprintf("ipAllowlistEnabled=%v trustedProxies=%v", enabledNow, trustedNow),
 			clientIP(r), r.UserAgent())
 
 		// Reload cache after settings update (so new trusted proxies/enable state takes effect immediately).
@@ -545,8 +558,8 @@ func (a *App) handleSecuritySettings(w http.ResponseWriter, r *http.Request) {
 
 		_ = json.NewEncoder(w).Encode(map[string]any{
 			"success":            true,
-			"ipAllowlistEnabled": a.ipAllowlistEnabled,
-			"trustedProxies":     a.trustedProxies,
+			"ipAllowlistEnabled": enabledNow,
+			"trustedProxies":     trustedNow,
 		})
 
 	default:

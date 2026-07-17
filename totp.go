@@ -380,6 +380,93 @@ func (a *App) handleDisableTOTP(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+// handleRegenerateTOTPRecoveryCodes regenerates recovery codes for the current user.
+// Requires a valid TOTP code (recovery codes cannot be used to regenerate).
+func (a *App) handleRegenerateTOTPRecoveryCodes(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		w.WriteHeader(http.StatusMethodNotAllowed)
+		return
+	}
+
+	userID, err := a.getUserIDFromRequest(r)
+	if err != nil {
+		w.WriteHeader(http.StatusUnauthorized)
+		_ = json.NewEncoder(w).Encode(map[string]string{"error": "unauthorized"})
+		return
+	}
+
+	user, err := a.getUserByID(userID)
+	if err != nil {
+		http.Error(w, "user not found", http.StatusNotFound)
+		return
+	}
+	if !user.TOTPEnabled {
+		http.Error(w, "TOTP not enabled", http.StatusBadRequest)
+		return
+	}
+
+	var req struct {
+		Code string `json:"code"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	code := strings.TrimSpace(req.Code)
+	if code == "" {
+		http.Error(w, "code required", http.StatusBadRequest)
+		return
+	}
+	if !verifyTOTPCode(user.TotpSecret, code) {
+		http.Error(w, "invalid code", http.StatusBadRequest)
+		return
+	}
+
+	codes, err := a.replaceRecoveryCodes(userID)
+	if err != nil {
+		http.Error(w, "failed to generate recovery codes", http.StatusInternalServerError)
+		return
+	}
+
+	_ = a.insertOpAudit("security.totp.recovery.regenerate", "security", fmt.Sprintf("userId=%d", userID), clientIP(r), r.UserAgent())
+	_ = json.NewEncoder(w).Encode(map[string]any{"success": true, "recoveryCodes": codes})
+}
+
+// handleAdminDisableTOTP disables TOTP for a specified user (admin recovery path).
+func (a *App) handleAdminDisableTOTP(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		w.WriteHeader(http.StatusMethodNotAllowed)
+		return
+	}
+
+	var req struct {
+		UserID int64 `json:"userId"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	if req.UserID == 0 {
+		http.Error(w, "userId required", http.StatusBadRequest)
+		return
+	}
+
+	_, err := a.db.Exec(
+		`UPDATE users SET totp_enabled = 0, totp_secret = '', updated_at = ? WHERE id = ?`,
+		time.Now().Format(time.RFC3339), req.UserID,
+	)
+	if err != nil {
+		http.Error(w, "failed to disable TOTP", http.StatusInternalServerError)
+		return
+	}
+
+	_, _ = a.db.Exec(`DELETE FROM totp_recovery_codes WHERE user_id = ?`, req.UserID)
+	_, _ = a.db.Exec(`DELETE FROM sessions WHERE user_id = ?`, req.UserID)
+
+	_ = a.insertOpAudit("security.totp.admin_disable", "security", fmt.Sprintf("userId=%d", req.UserID), clientIP(r), r.UserAgent())
+	_ = json.NewEncoder(w).Encode(map[string]any{"success": true})
+}
+
 // generateTOTPSecret generates a random TOTP secret
 func generateTOTPSecret() (string, error) {
 	secret := make([]byte, 20) // 160 bits

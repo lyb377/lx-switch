@@ -301,6 +301,8 @@ func (a *App) newMux() *http.ServeMux {
 	mux.HandleFunc("/api/totp/enable", a.withIPAllowlist(a.withRBACAuth("", a.handleEnableTOTP)))
 	mux.HandleFunc("/api/totp/confirm", a.withIPAllowlist(a.withRBACAuth("", a.handleConfirmTOTP)))
 	mux.HandleFunc("/api/totp/disable", a.withIPAllowlist(a.withRBACAuth("", a.handleDisableTOTP)))
+	mux.HandleFunc("/api/totp/recovery/regenerate", a.withIPAllowlist(a.withRBACAuth("", a.handleRegenerateTOTPRecoveryCodes)))
+	mux.HandleFunc("/api/totp/admin-disable", a.withIPAllowlist(a.withRBACAuth(PermUsersWrite, a.handleAdminDisableTOTP)))
 
 	return mux
 }
@@ -416,7 +418,7 @@ func (a *App) handleLogin(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	t := strings.TrimSpace(r.FormValue("token"))
-	if t != a.adminToken {
+	if !secureCompare(t, a.adminToken) {
 		remain, locked := a.recordFailure(ip)
 		_ = a.insertLoginAudit(ip, ua, false, "bad_token")
 		status := http.StatusUnauthorized
